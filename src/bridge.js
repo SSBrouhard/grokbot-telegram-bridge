@@ -23,6 +23,7 @@ const HELP = [
 ].join("\n");
 
 const APPROVAL_TTL_MS = 10 * 60_000;
+const ROUTINE_WIDGET_TTL_MS = 12 * 60 * 60_000;
 const APPROVAL_TEXT_LIMIT = 3_500;
 const SKILL_LIST_LIMIT = 20;
 
@@ -67,6 +68,22 @@ function formatApproval(details) {
   }
   lines.push("This authorization applies to this request only and expires in 10 minutes.");
   return lines.join("\n");
+}
+
+function routineWidgetDetails(entry) {
+  if (entry?.kind !== "send-message" || entry.message?.type !== "widget") return undefined;
+  const widget = entry.message.widget;
+  if (!widget || typeof widget.prompt !== "string") return undefined;
+  const choices = (Array.isArray(widget.options) ? widget.options : [])
+    .filter((option) => typeof option?.label === "string" && option.label
+      && typeof option?.value === "string" && option.value)
+    .slice(0, 10)
+    .map((option) => ({ label: option.label.slice(0, 64), value: option.value }));
+  if (!choices.length) return undefined;
+  return {
+    text: [widget.prompt, widget.helpText].filter((value) => typeof value === "string" && value).join("\n\n"),
+    choices,
+  };
 }
 
 function messageAttachments(message) {
@@ -485,13 +502,88 @@ export class Bridge {
     if (!unseen.length) return;
     const promptIndex = unseen.findIndex((entry) => isTopLevelPromptEntry(entry)
       && typeof entry?.id === "string" && entry.id);
+    const autonomousIndex = unseen.findIndex((entry) => entry?.kind === "send-message"
+      && typeof entry?.id === "string" && entry.id);
+    if (autonomousIndex >= 0 && (promptIndex < 0 || autonomousIndex < promptIndex)) {
+      if (agent.isRunning === true || agent.isComposingMessage === true
+        || await this.grok.isAgentBusy(agent.id, options)) return;
+      const turnEnd = promptIndex < 0 ? unseen.length : promptIndex;
+      const autonomousEntries = unseen.slice(autonomousIndex, turnEnd)
+        .filter((entry) => entry?.kind === "send-message");
+      await this.mirrorAutonomousOutput(agent, autonomousEntries, options);
+      return;
+    }
     if (promptIndex < 0) return;
     await this.mirrorDesktopTurn(agent, unseen[promptIndex], options);
+  }
+
+  async mirrorAutonomousOutput(agent, entries, options = {}) {
+    if (!entries.length) return;
+    for (const entry of entries) {
+      if (typeof entry?.id !== "string" || !entry.id) {
+        throw new Error("Grok returned no transcript cursor for autonomous output");
+      }
+      const widget = entry.message?.type === "widget";
+      if (widget) {
+        await this.sendRoutineWidget(this.mirrorChatId, agent.id, entry, {
+          ...options,
+          widgetUserId: this.mirrorUserId,
+        });
+      } else {
+        const reply = this.grok.getReplyContent([entry]);
+        let rootMessageId;
+        if (reply.text) {
+          const sent = await this.telegram.sendMessage(
+            this.mirrorChatId,
+            `⏰ Routine · ${agent.name}\n\n${reply.text}`,
+            options,
+          );
+          rootMessageId = sent?.message_id;
+        }
+        const replyOptions = Number.isSafeInteger(rootMessageId)
+          ? { ...options, replyToMessageId: rootMessageId }
+          : options;
+        for (const attachment of reply.attachments ?? []) {
+          const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
+          await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
+        }
+        if (!reply.text && !(reply.attachments ?? []).length) {
+          await this.telegram.sendMessage(
+            this.mirrorChatId,
+            "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it.",
+            options,
+          );
+        }
+      }
+      await this.state.setMirrorCursor(agent.id, entry.id);
+    }
   }
 
   async mirrorDesktopTurn(agent, promptEntry, options = {}) {
     const clientNonce = typeof promptEntry?.clientNonce === "string" ? promptEntry.clientNonce : undefined;
     const waitOptions = { ...options, promptEntryId: promptEntry.id };
+    const widgetToken = /^telegram:widget:([A-Za-z0-9_-]{24}):[0-9a-z]$/.exec(clientNonce ?? "")?.[1];
+    if (widgetToken) {
+      const widget = this.state.getApproval(widgetToken);
+      if (widget?.type === "routine-widget") {
+        if (!widget.submitted || widget.resolving) return;
+        widget.resolving = true;
+        await this.state.setApproval(widgetToken, widget);
+        try {
+          const reply = await this.grok.waitForReply(agent.id, clientNonce, waitOptions);
+          await this.deliverRoutineWidgetReply(widget, reply, options);
+          if (typeof reply?.messageId === "string" && reply.messageId) {
+            await this.state.setMirrorCursor(agent.id, reply.messageId);
+          }
+          await this.state.deleteApproval(widgetToken);
+        } catch (error) {
+          widget.resolving = false;
+          await this.state.setApproval(widgetToken, widget);
+          throw error;
+        }
+        return;
+      }
+    }
     if (clientNonce?.startsWith("telegram:")) {
       const skippedReply = await this.grok.waitForReply(agent.id, clientNonce, waitOptions);
       if (typeof skippedReply?.messageId === "string" && skippedReply.messageId) {
@@ -615,9 +707,51 @@ export class Bridge {
     }
   }
 
+  async sendRoutineWidget(chatId, agentId, entry, options = {}) {
+    const details = routineWidgetDetails(entry);
+    if (!details || details.text.length > APPROVAL_TEXT_LIMIT) {
+      await this.telegram.sendMessage(
+        chatId,
+        "This routine choice cannot be displayed safely in Telegram. Open Grok Bot to review it.",
+        options,
+      );
+      return;
+    }
+    const token = randomBytes(18).toString("base64url");
+    const widget = {
+      type: "routine-widget",
+      agentId,
+      entryId: entry.id,
+      choices: details.choices,
+      chatId,
+      userId: options.widgetUserId,
+      expiresAt: Date.now() + ROUTINE_WIDGET_TTL_MS,
+    };
+    await this.state.setApproval(token, widget);
+    try {
+      const sent = await this.telegram.sendMessage(chatId, details.text, {
+        ...options,
+        inlineKeyboard: details.choices.map((choice, index) => [{
+          text: choice.label,
+          callback_data: `gtw:${token}:${index.toString(36)}`,
+        }]),
+      });
+      widget.messageId = sent?.message_id;
+      await this.state.setApproval(token, widget);
+    } catch (error) {
+      await this.state.deleteApproval(token);
+      throw error;
+    }
+  }
+
   async handleCallbackQuery(update, options = {}) {
     const callback = update?.callback_query;
     if (!this.isAuthorizedCallback(callback)) return;
+    const widgetMatch = /^gtw:([A-Za-z0-9_-]{24}):([0-9a-z])$/.exec(callback.data ?? "");
+    if (widgetMatch) {
+      await this.handleRoutineWidgetCallback(callback, widgetMatch[1], Number.parseInt(widgetMatch[2], 36), options);
+      return;
+    }
     const match = /^gta:([A-Za-z0-9_-]{24}):([ad])$/.exec(callback.data ?? "");
     if (!match) {
       await this.telegram.answerCallbackQuery(callback.id, "Unknown or invalid approval.", options);
@@ -693,12 +827,77 @@ export class Bridge {
     }
   }
 
+  async handleRoutineWidgetCallback(callback, token, choiceIndex, options = {}) {
+    const widget = this.state.getApproval(token);
+    const choice = widget?.choices?.[choiceIndex];
+    if (!widget || widget.type !== "routine-widget" || !choice
+      || widget.chatId !== callback.message.chat.id
+      || widget.userId !== callback.from.id
+      || widget.messageId !== callback.message.message_id) {
+      await this.telegram.answerCallbackQuery(callback.id, "This option is not valid for this chat.", options);
+      return;
+    }
+    if (widget.expiresAt <= Date.now()) {
+      await this.state.deleteApproval(token);
+      await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
+      await this.telegram.answerCallbackQuery(callback.id, "This option expired.", options);
+      return;
+    }
+    if (widget.resolving) {
+      await this.telegram.answerCallbackQuery(callback.id, "That choice is already being processed.", options);
+      return;
+    }
+
+    widget.resolving = true;
+    await this.state.setApproval(token, widget);
+    try {
+      const clientNonce = `telegram:widget:${token}:${choiceIndex.toString(36)}`;
+      await this.grok.sendPrompt(widget.agentId, choice.value, clientNonce, options);
+      widget.submitted = true;
+      widget.clientNonce = clientNonce;
+      await this.state.setApproval(token, widget);
+      await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
+      await this.telegram.answerCallbackQuery(callback.id, "Sent to Grok.", options).catch(() => {});
+      const reply = await this.grok.waitForReply(widget.agentId, clientNonce, options);
+      await this.deliverRoutineWidgetReply(widget, reply, options);
+      if (typeof reply.messageId === "string" && reply.messageId) {
+        await this.state.setMirrorCursor(widget.agentId, reply.messageId);
+      }
+      await this.state.deleteApproval(token);
+    } catch (error) {
+      if (this.state.getApproval(token)) {
+        widget.resolving = false;
+        await this.state.setApproval(token, widget);
+      }
+      throw error;
+    }
+  }
+
+  async deliverRoutineWidgetReply(widget, reply, options = {}) {
+    const replyOptions = { ...options, replyToMessageId: widget.messageId };
+    if (reply.text) await this.telegram.sendMessage(widget.chatId, reply.text, replyOptions);
+    for (const attachment of reply.attachments ?? []) {
+      const bytes = await this.grok.readAttachment(widget.agentId, attachment.path, options);
+      await this.telegram.sendAttachment(widget.chatId, { ...attachment, bytes }, replyOptions);
+    }
+    if (!reply.text && !(reply.attachments ?? []).length) {
+      await this.telegram.sendMessage(widget.chatId, "Grok completed without a Telegram-renderable response.", replyOptions);
+    }
+  }
+
   async handleCallbackError(update, options = {}) {
     const callback = update?.callback_query;
     if (!this.isAuthorizedCallback(callback)) return;
+    const routineWidget = /^gtw:/.test(callback.data ?? "");
+    const routineToken = /^gtw:([A-Za-z0-9_-]{24}):/.exec(callback.data ?? "")?.[1];
+    const choiceWasSent = routineToken && this.state.getApproval(routineToken)?.submitted === true;
     await this.telegram.answerCallbackQuery(
       callback.id,
-      "Could not apply that decision. The request remains unapproved.",
+      choiceWasSent
+        ? "Choice sent. Reply delivery will retry automatically."
+        : routineWidget
+        ? "Could not finish that choice. Check the chat before trying again."
+        : "Could not apply that decision. The request remains unapproved.",
       options,
     ).catch(() => {});
   }

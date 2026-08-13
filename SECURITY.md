@@ -23,6 +23,6 @@ If you find a security issue, do **not** open a public GitHub issue.
 
 It does not expose an inbound internet port or webhook. Telegram access is outbound HTTPS long polling only.
 
-Approval buttons are one-time and expire after 10 minutes. They never map to Grok's persistent `always` or `never` permissions. Secrets, captchas, rich widgets, and oversized approval text are refused and must be handled in Grok Bot on desktop.
+Permission approval buttons are one-time and expire after 10 minutes. They never map to Grok's persistent `always` or `never` permissions. Autonomous routine choice cards are separate: they are bound to the configured mirror user, chat, Telegram message, Grok agent, and transcript entry; submit the selected exact value as a new prompt; and expire after 12 hours. Secrets, captchas, other rich widgets, and oversized content are refused and must be handled in Grok Bot on desktop.
 
 Transcript prompts whose top-level `clientNonce` starts with `telegram:` were created by this bridge. The mirror watcher excludes each such prompt and its response turn to prevent reflection and feedback loops. Desktop mirror cursors are owner-only bridge state and advance after successful Telegram delivery; delivery is intentionally at-least-once across crashes.

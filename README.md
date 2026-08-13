@@ -108,6 +108,8 @@ flowchart LR
 
 Approval buttons are bound to the initiating user, chat, Telegram message, Grok agent, transcript entry, and request ID. For a desktop-mirrored turn, the initiating identity is the configured mirror user and chat. The bridge rechecks that the Grok request is still pending before applying a decision. Approvals survive process restarts, expire after 10 minutes, and never map to Grok's persistent `always` or `never` values.
 
+Autonomous routine choice cards use a separate contract. They are delivered only to the configured mirror user and chat, are bound to their Telegram message and Grok transcript entry, and expire after 12 hours. A choice submits the card's exact value to the same Grok agent as a new prompt. The bridge removes the keyboard after submission and retries reply delivery after a bridge restart without submitting the choice again.
+
 Treat Telegram account security as part of this boundary. Enable Telegram two-step verification and a device passcode. Do not send passwords, API keys, or other secrets through the bot.
 
 ## What it does
@@ -142,7 +144,7 @@ Exact `@Agent Name` and `@Routine Name` text is converted to the same structured
 
 Any other text, photo, or file is sent as a prompt. Captions on attachments are used as the prompt when present.
 
-Supported approvals offer only **Approve once** and **Deny**. Secrets, captchas, rich widgets, persistent permissions, and approval details too large to display completely are refused. Open Grok Bot on desktop for those.
+Supported permission approvals offer only **Approve once** and **Deny**. Autonomous routine choice cards are also relayed when they contain Telegram-safe text and options. Secrets, captchas, other rich widgets, persistent permissions, and content too large to display completely are refused. Open Grok Bot on desktop for those.
 
 ## Desktop mirroring
 

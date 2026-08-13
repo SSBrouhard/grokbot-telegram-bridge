@@ -44,6 +44,49 @@ test("persists per-agent mirror cursors and the enabled override across restart"
   assert.equal(reloaded.isMirrorEnabled(false), false);
 });
 
+test("prunes expired Telegram actions from persisted state", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-actions-"));
+  const filename = path.join(directory, "state.json");
+  await writeFile(filename, `${JSON.stringify({
+    offset: 0,
+    agentsByChat: {},
+    pendingApprovals: {
+      expired: { type: "routine-widget", expiresAt: Date.now() - 1 },
+      active: { type: "routine-widget", expiresAt: Date.now() + 60_000 },
+    },
+  })}\n`, { mode: 0o600 });
+
+  const store = new JsonStateStore(filename);
+  await store.load();
+
+  assert.equal(store.getApproval("expired"), undefined);
+  assert.equal(store.getApproval("active").type, "routine-widget");
+  assert.equal(JSON.parse(await readFile(filename, "utf8")).pendingApprovals.expired, undefined);
+});
+
+test("makes an interrupted submitted routine widget recoverable after restart", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-widget-recovery-"));
+  const filename = path.join(directory, "state.json");
+  await writeFile(filename, `${JSON.stringify({
+    offset: 0,
+    agentsByChat: {},
+    pendingApprovals: {
+      widget: {
+        type: "routine-widget",
+        submitted: true,
+        resolving: true,
+        expiresAt: Date.now() + 60_000,
+      },
+    },
+  })}\n`, { mode: 0o600 });
+
+  const store = new JsonStateStore(filename);
+  await store.load();
+
+  assert.equal(store.getApproval("widget").submitted, true);
+  assert.equal(store.getApproval("widget").resolving, false);
+});
+
 test("quarantines malformed state and starts cleanly", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-"));
   const filename = path.join(directory, "state.json");

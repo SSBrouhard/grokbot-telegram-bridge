@@ -7,6 +7,8 @@ import { GrokClient } from "../src/grok-client.js";
 function mirrorHarness(options = {}) {
   const sent = [];
   const attachments = [];
+  const callbackAnswers = [];
+  const markupEdits = [];
   const agents = [
     { id: "chief", name: "Chief of Staff", isRunning: false },
     { id: "research", name: "Research", isRunning: false },
@@ -42,15 +44,19 @@ function mirrorHarness(options = {}) {
       attachments.push({ chatId, attachment, options: sendOptions });
       return { message_id: 100 + attachments.length };
     },
-    async answerCallbackQuery() {},
-    async editMessageReplyMarkup() {},
+    async answerCallbackQuery(callbackId, text) { callbackAnswers.push({ callbackId, text }); },
+    async editMessageReplyMarkup(chatId, messageId, inlineKeyboard) {
+      markupEdits.push({ chatId, messageId, inlineKeyboard });
+    },
   };
   const grok = {
     pollIntervalMs: 1,
     async listAgents() { return agents; },
     async getTranscriptTail(agentId) { return transcripts.get(agentId) ?? []; },
     async getTranscript(agentId) { return transcripts.get(agentId) ?? []; },
+    async isAgentBusy() { return false; },
     getPromptContent: GrokClient.prototype.getPromptContent,
+    getReplyContent: GrokClient.prototype.getReplyContent,
     async waitForReply() { return { messageId: "final", text: "Finished.", attachments: [] }; },
     async readAttachment() { return new Uint8Array([1, 2, 3]); },
   };
@@ -64,7 +70,18 @@ function mirrorHarness(options = {}) {
     mirrorChatId: options.configured === false ? undefined : 99,
     mirrorUserId: options.configured === false ? undefined : 42,
   });
-  return { bridge, telegram, grok, state, sent, attachments, agents, transcripts };
+  return {
+    bridge,
+    telegram,
+    grok,
+    state,
+    sent,
+    attachments,
+    agents,
+    transcripts,
+    callbackAnswers,
+    markupEdits,
+  };
 }
 
 const command = (text, userId = 42, chatId = 99) => ({
@@ -98,6 +115,247 @@ test("mirrors a desktop prompt and completed Markdown response in one Telegram r
   assert.equal(harness.sent[1].text, "## Finished\n\n- result");
   assert.equal(harness.sent[1].options.replyToMessageId, harness.sent[0].message_id);
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "final");
+});
+
+test("mirrors autonomous routine output and sends its selected action back to Grok", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    {
+      id: "routine-text",
+      kind: "send-message",
+      message: { type: "text", content: "Morning revenue proposal" },
+    },
+    {
+      id: "routine-widget",
+      kind: "send-message",
+      message: {
+        type: "widget",
+        widget: {
+          prompt: "Approve today's must-win?",
+          helpText: "Proposal-only. Nothing is sent until you choose.",
+          options: [
+            { label: "Draft follow-up", value: "Approve RF-1 draft follow-up", style: "primary" },
+            { label: "Skip today", value: "Skip RF-1", style: "danger" },
+          ],
+        },
+      },
+    },
+  );
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /Morning revenue proposal/);
+  assert.match(harness.sent[1].text, /Approve today's must-win/);
+  assert.deepEqual(
+    harness.sent[1].options.inlineKeyboard.map((row) => row[0].text),
+    ["Draft follow-up", "Skip today"],
+  );
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-widget");
+
+  let submitted;
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async (agentId, text, nonce) => {
+    submissionCount += 1;
+    submitted = { agentId, text, nonce };
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "routine-choice-reply",
+    text: "Draft ready for review.",
+    attachments: [],
+  });
+  const callbackData = harness.sent[1].options.inlineKeyboard[0][0].callback_data;
+
+  await harness.bridge.handleCallbackQuery({ callback_query: {
+    id: "routine-callback",
+    data: callbackData,
+    from: { id: 42 },
+    message: { message_id: harness.sent[1].message_id, chat: { id: 99, type: "private" } },
+  } });
+
+  assert.equal(submitted.agentId, "chief");
+  assert.equal(submitted.text, "Approve RF-1 draft follow-up");
+  assert.match(submitted.nonce, /^telegram:widget:/);
+  assert.equal(harness.callbackAnswers.at(-1).text, "Sent to Grok.");
+  assert.deepEqual(harness.markupEdits.at(-1).inlineKeyboard, []);
+  assert.equal(harness.sent.at(-1).text, "Draft ready for review.");
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, harness.sent[1].message_id);
+  assert.equal(harness.state.approvals.size, 0);
+
+  await harness.bridge.handleCallbackQuery({ callback_query: {
+    id: "routine-replay",
+    data: callbackData,
+    from: { id: 42 },
+    message: { message_id: harness.sent[1].message_id, chat: { id: 99, type: "private" } },
+  } });
+  assert.equal(submissionCount, 1);
+  assert.match(harness.callbackAnswers.at(-1).text, /not valid/);
+});
+
+test("checkpoints each autonomous entry so a failed widget retry does not duplicate prior text", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-text", kind: "send-message", message: { type: "text", content: "First update" } },
+    {
+      id: "routine-widget",
+      kind: "send-message",
+      message: { type: "widget", widget: {
+        prompt: "Choose",
+        options: [{ label: "Continue", value: "Continue" }],
+      } },
+    },
+  );
+  const originalSend = harness.telegram.sendMessage;
+  let failWidget = true;
+  harness.telegram.sendMessage = async (chatId, text, options) => {
+    if (text === "Choose" && failWidget) {
+      failWidget = false;
+      throw new Error("Telegram unavailable");
+    }
+    return originalSend(chatId, text, options);
+  };
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /Telegram unavailable/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-text");
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.filter((message) => /First update/.test(message.text)).length, 1);
+  assert.equal(harness.sent.filter((message) => message.text === "Choose").length, 1);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-widget");
+});
+
+test("delivers every backlogged autonomous text entry in transcript order", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-one", kind: "send-message", message: { type: "text", content: "First routine" } },
+    { id: "routine-two", kind: "send-message", message: { type: "text", content: "Second routine" } },
+  );
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /First routine/);
+  assert.match(harness.sent[1].text, /Second routine/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-two");
+});
+
+test("refuses to rewind the mirror cursor when autonomous output has no entry id", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-one", kind: "send-message", message: { type: "text", content: "First routine" } },
+    { kind: "send-message", message: { type: "text", content: "Missing id" } },
+  );
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /no transcript cursor/);
+
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-one");
+});
+
+test("sends a desktop handoff when a routine widget is too large for Telegram", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "large-widget",
+    kind: "send-message",
+    message: { type: "widget", widget: {
+      prompt: "x".repeat(3_501),
+      options: [{ label: "Continue", value: "Continue" }],
+    } },
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /cannot be displayed safely/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "large-widget");
+});
+
+test("rejects routine widget callbacks outside their bound user, chat, and message", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "routine-widget",
+    kind: "send-message",
+    message: { type: "widget", widget: {
+      prompt: "Choose",
+      options: [{ label: "Continue", value: "Continue" }],
+    } },
+  });
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  let promptCount = 0;
+  harness.grok.sendPrompt = async () => { promptCount += 1; };
+
+  for (const callback of [
+    { from: { id: 7 }, message: { message_id: harness.sent[0].message_id, chat: { id: 99, type: "private" } } },
+    { from: { id: 42 }, message: { message_id: harness.sent[0].message_id, chat: { id: 88, type: "private" } } },
+    { from: { id: 42 }, message: { message_id: 999, chat: { id: 99, type: "private" } } },
+  ]) {
+    await harness.bridge.handleCallbackQuery({ callback_query: { id: "invalid", data, ...callback } });
+  }
+
+  assert.equal(promptCount, 0);
+  assert.equal(harness.callbackAnswers.length, 3);
+  assert.ok(harness.callbackAnswers.every((answer) => /not valid/.test(answer.text)));
+});
+
+test("expires routine widget callbacks without sending a Grok prompt", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "routine-widget",
+    kind: "send-message",
+    message: { type: "widget", widget: {
+      prompt: "Choose",
+      options: [{ label: "Continue", value: "Continue" }],
+    } },
+  });
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  const token = /^gtw:([^:]+):/.exec(data)[1];
+  harness.state.approvals.get(token).expiresAt = Date.now() - 1;
+  let promptCount = 0;
+  harness.grok.sendPrompt = async () => { promptCount += 1; };
+
+  await harness.bridge.handleCallbackQuery({ callback_query: {
+    id: "expired",
+    data,
+    from: { id: 42 },
+    message: { message_id: harness.sent[0].message_id, chat: { id: 99, type: "private" } },
+  } });
+
+  assert.equal(promptCount, 0);
+  assert.equal(harness.state.approvals.has(token), false);
+  assert.equal(harness.callbackAnswers.at(-1).text, "This option expired.");
+  assert.deepEqual(harness.markupEdits.at(-1).inlineKeyboard, []);
+});
+
+test("recovers a submitted routine widget reply through the desktop mirror", async () => {
+  const harness = mirrorHarness();
+  harness.state.approvals.set("abcdefghijklmnopqrstuvwx", {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    submitted: true,
+    resolving: false,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce: "telegram:widget:abcdefghijklmnopqrstuvwx:0",
+    message: { type: "text", content: "Continue" },
+  });
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Recovered reply",
+    attachments: [],
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.at(-1).text, "Recovered reply");
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, 55);
+  assert.equal(harness.state.approvals.size, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
 });
 
 test("skips a Telegram-originated prompt and its complete response turn", async () => {

@@ -40,6 +40,7 @@ export class JsonStateStore {
       this.mirrorCursors = parsed.mirrorCursors && typeof parsed.mirrorCursors === "object"
         ? parsed.mirrorCursors
         : {};
+      if (this.#prepareApprovalsAfterLoad()) await this.#save();
     } catch (error) {
       if (error.code === "ENOENT") return;
       if (!(error instanceof SyntaxError)) throw error;
@@ -90,6 +91,7 @@ export class JsonStateStore {
   }
 
   async setApproval(token, approval) {
+    this.#pruneExpiredApprovals();
     this.pendingApprovals[token] = approval;
     await this.#save();
   }
@@ -97,6 +99,28 @@ export class JsonStateStore {
   async deleteApproval(token) {
     delete this.pendingApprovals[token];
     await this.#save();
+  }
+
+  #pruneExpiredApprovals(now = Date.now()) {
+    let changed = false;
+    for (const [token, approval] of Object.entries(this.pendingApprovals)) {
+      if (Number.isFinite(approval?.expiresAt) && approval.expiresAt <= now) {
+        delete this.pendingApprovals[token];
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  #prepareApprovalsAfterLoad() {
+    let changed = this.#pruneExpiredApprovals();
+    for (const approval of Object.values(this.pendingApprovals)) {
+      if (approval?.type === "routine-widget" && approval.resolving === true) {
+        approval.resolving = false;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   async #save() {
