@@ -693,6 +693,60 @@ test("serializes concurrent widget callbacks so a choice is submitted once", asy
   assert.equal(harness.sent.filter((message) => message.text === "One reply").length, 1);
 });
 
+test("does not resurrect a completed widget prompt context on later mirror polls", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  await harness.state.setApproval(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    selectedValue: "Continue",
+    submissionIntent: true,
+    submitted: true,
+    accepted: true,
+    replyDelivered: true,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push(
+    {
+      id: "t141u",
+      kind: "message",
+      clientNonce,
+      message: { type: "text", content: "Continue" },
+    },
+    { id: "t141s0", kind: "send-message", message: { type: "text", content: "First reply" } },
+    { id: "t141s1", kind: "send-message", message: { type: "text", content: "Second reply" } },
+    { id: "t141s2", kind: "send-message", message: { type: "text", content: "Third reply" } },
+  );
+  await harness.state.setMirrorCursor("chief", "t141s2");
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+  harness.grok.waitForReply = async () => ({
+    messageId: "t141s2",
+    text: "Should not wait again",
+    attachments: [],
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+  await harness.bridge.pollDesktopMirrorOnce();
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.state.getPromptContext("chief", clientNonce), undefined);
+  assert.equal(harness.state.listPromptContexts("chief").length, 0);
+  assert.equal(harness.sent.length, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "t141s2");
+  assert.equal(harness.state.getApproval(token).replyDelivered, true);
+  assert.equal(harness.state.getApproval(token).submissionIntent, true);
+});
+
 test("skips a Telegram-originated prompt and its complete response turn", async () => {
   const harness = mirrorHarness();
   harness.transcripts.get("chief").push({

@@ -1158,6 +1158,7 @@ export class Bridge {
     const pending = this.listRoutineWidgets().filter(([, widget]) => (
       widget.agentId === agentId
       && widget.submissionIntent === true
+      && widget.replyDelivered !== true
       && typeof widget.clientNonce === "string"
       && widget.clientNonce
     ));
