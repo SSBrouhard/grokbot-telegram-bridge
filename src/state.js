@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export class JsonStateStore {
@@ -13,7 +14,19 @@ export class JsonStateStore {
   async load() {
     await mkdir(path.dirname(this.filename), { recursive: true });
     try {
-      const parsed = JSON.parse(await readFile(this.filename, "utf8"));
+      const descriptor = await open(this.filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let raw;
+      try {
+        const metadata = await descriptor.stat();
+        if (!metadata.isFile()) throw new Error("BRIDGE_STATE_PATH must be a regular file");
+        if ((metadata.mode & 0o077) !== 0) {
+          throw new Error("BRIDGE_STATE_PATH must not be readable or writable by group or others");
+        }
+        raw = await descriptor.readFile("utf8");
+      } finally {
+        await descriptor.close();
+      }
+      const parsed = JSON.parse(raw);
       this.offset = Number.isSafeInteger(parsed.offset) ? parsed.offset : 0;
       this.agentsByChat = parsed.agentsByChat && typeof parsed.agentsByChat === "object"
         ? parsed.agentsByChat
@@ -66,7 +79,7 @@ export class JsonStateStore {
         agentsByChat: this.agentsByChat,
         pendingApprovals: this.pendingApprovals,
       })}\n`;
-      await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600 });
+      await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
       await rename(temporary, this.filename);
     };
     const pending = this.saveQueue.then(save, save);

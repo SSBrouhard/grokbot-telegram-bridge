@@ -10,7 +10,12 @@ test("uses Grok's command envelope", async () => {
     { ok: true, json: async () => ({ accepted: true }) },
   ];
   const fetchImpl = async (url, options) => {
-    requests.push({ url, headers: options.headers, body: JSON.parse(options.body) });
+    requests.push({
+      url,
+      headers: options.headers,
+      body: JSON.parse(options.body),
+      redirect: options.redirect,
+    });
     return responses.shift();
   };
   const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", { fetchImpl });
@@ -28,6 +33,7 @@ test("uses Grok's command envelope", async () => {
     directAddressedAcceptance: true,
   });
   assert.equal(requests[0].headers.authorization, "Bearer gateway-token");
+  assert.ok(requests.every((request) => request.redirect === "error"));
 });
 
 test("maps approval decisions only to one-shot or deny resolutions", async () => {

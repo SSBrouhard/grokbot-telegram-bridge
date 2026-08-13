@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 BRIDGE_HOME=${BRIDGE_HOME:-/home/box/grokbot-telegram-bridge}
 PID_FILE="$BRIDGE_HOME/bridge.pid"

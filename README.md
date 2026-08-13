@@ -18,7 +18,7 @@ Voice notes are forwarded with an explicit transcription instruction. Replies us
 
 ## Prerequisites
 
-- Node.js 20 or newer. There are no registry dependencies.
+- Node.js 20.6 or newer (the first release with `--env-file`). There are no registry dependencies.
 - A Grok Bot remote computer whose Sand gateway is reachable at `http://127.0.0.1:1340`.
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
 - Grok Bot's existing `gateway.json` discovery record, readable only by its owner (mode `600`), referenced by `GROK_GATEWAY_TOKEN_FILE`.
@@ -30,7 +30,9 @@ This project does not run Grok for you. If the desktop agent and local gateway a
 
 Keep both allowlists set and narrow. Every inbound update must be a **private** chat and must match **both** `TELEGRAM_ALLOWED_USER_IDS` and `TELEGRAM_ALLOWED_CHAT_IDS`. Unauthorized updates are dropped with no reply.
 
-`GROK_GATEWAY_URL` must resolve to `127.0.0.1`, `localhost`, or `::1`. The Grok token is sent only to that loopback URL. The Telegram token is sent only to `api.telegram.org`. Neither token is logged.
+`GROK_GATEWAY_URL` must use the exact host `127.0.0.1`, `localhost`, or `::1`. The Grok token is sent only to that loopback URL, and gateway redirects are refused. The Telegram token is sent only to `api.telegram.org`. Neither token is logged.
+
+The gateway discovery record and any existing bridge state file must be regular, non-symlink files with no group or other permissions (mode `600` is recommended). New state, log, PID, and control-lock files created by the control script are owner-only.
 
 Approval buttons are bound to the initiating user, chat, Telegram message, Grok agent, transcript entry, and request ID. The bridge rechecks that the Grok request is still pending before applying a decision. Approvals survive process restarts, expire after 10 minutes, and never map to Grok's persistent `always` or `never` values.
 
@@ -53,7 +55,7 @@ There is no `npm install`. Edit `.env`:
 1. Put the BotFather token in `TELEGRAM_BOT_TOKEN`.
 2. Leave `GROK_GATEWAY_URL` on loopback.
 3. Point `GROK_GATEWAY_TOKEN_FILE` at the mode-`600` `gateway.json` (or set `GROK_GATEWAY_TOKEN` if you must inject the token another way).
-4. Set `BRIDGE_STATE_PATH` to a file on the persistent volume.
+4. Set `BRIDGE_STATE_PATH` to a file on the persistent volume. The bridge creates it with mode `600`; tighten an existing file with `chmod 600` before startup.
 
 Grok currently writes `gateway.json` as mode `644` even though it contains a bearer token. The bridge will not read that file until you tighten it to `600`. Recheck the mode after a Grok computer update; the platform may recreate it.
 
@@ -125,7 +127,7 @@ To uninstall: `stop`, delete the project directory (including `.env` and `bridge
 | Symptom | What to check |
 | --- | --- |
 | `Missing .../.env` or mode error | `.env` must exist and be mode `600` |
-| Gateway token file rejected | `chmod 600` the discovery record; it must be a regular file, not a symlink |
+| Gateway token or state file rejected | `chmod 600` the file; it must be a regular file, not a symlink |
 | `GROK_GATEWAY_URL must use a loopback host` | Use `127.0.0.1`, `localhost`, or `::1` only |
 | Bot never replies | Both allowlists must include the numeric IDs; groups and channels are ignored |
 | `discover-ids` prints nothing | Send `/start` first, then run it again |

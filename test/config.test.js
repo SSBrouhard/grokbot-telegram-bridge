@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -53,6 +53,10 @@ test("reads the existing gateway token from a private discovery record", (t) => 
   assert.equal(loadConfig(env).gatewayToken, "from-file");
   chmodSync(filename, 0o644);
   assert.throws(() => loadConfig(env), /group or others/);
+
+  const symlink = path.join(directory, "gateway-link.json");
+  symlinkSync(filename, symlink);
+  assert.throws(() => loadConfig({ ...env, GROK_GATEWAY_TOKEN_FILE: symlink }));
 });
 
 test("rejects a non-loopback Grok gateway by default", () => {

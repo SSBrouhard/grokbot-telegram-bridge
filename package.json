@@ -2,6 +2,14 @@
   "name": "grokbot-telegram-bridge",
   "version": "0.1.0",
   "private": true,
+  "files": [
+    ".env.example",
+    "deploy/",
+    "src/",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
   "license": "MIT",
   "description": "Unofficial self-hosted Telegram bridge for Grok Bot's local Sand gateway.",
   "repository": {
@@ -14,7 +22,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.6.0"
   },
   "scripts": {
     "start": "node --env-file=.env src/main.js",

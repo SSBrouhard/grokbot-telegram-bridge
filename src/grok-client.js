@@ -28,6 +28,7 @@ export class GrokClient {
         authorization: `Bearer ${this.token}`,
       },
       body: JSON.stringify(args),
+      redirect: "error",
       signal,
     });
     if (!response.ok) throw new Error(`Grok gateway ${method} failed with HTTP ${response.status}`);

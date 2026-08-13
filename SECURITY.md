@@ -12,9 +12,9 @@ If you find a security issue, do **not** open a public GitHub issue.
 
 ## Hard requirements
 
-- `GROK_GATEWAY_URL` must be a loopback host (`127.0.0.1`, `localhost`, or `::1`). The process refuses other hosts.
+- `GROK_GATEWAY_URL` must be a loopback host (`127.0.0.1`, `localhost`, or `::1`). The process refuses other hosts and gateway redirects.
 - Every inbound Telegram update must be a private chat and must match both `TELEGRAM_ALLOWED_USER_IDS` and `TELEGRAM_ALLOWED_CHAT_IDS`. Other updates are ignored.
-- Keep `.env` and `GROK_GATEWAY_TOKEN_FILE` mode `600`. The bridge will not read a gateway discovery file that is group- or world-readable.
+- Keep `.env`, `GROK_GATEWAY_TOKEN_FILE`, and any existing `BRIDGE_STATE_PATH` mode `600`. Gateway discovery and state files must be regular, non-symlink files; the bridge refuses them when group or other permissions are set.
 - Never commit `.env`, `bridge-state.json`, `gateway.json`, `bridge.log`, or `bridge.pid`.
 - Do not send passwords, API keys, or other secrets through Telegram.
 
