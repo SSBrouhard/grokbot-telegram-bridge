@@ -44,6 +44,38 @@ test("persists per-agent mirror cursors and the enabled override across restart"
   assert.equal(reloaded.isMirrorEnabled(false), false);
 });
 
+test("persists prompt delivery context and consumes a completed turn boundary", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-prompt-context-"));
+  const filename = path.join(directory, "state.json");
+  const store = new JsonStateStore(filename);
+  await store.load();
+  await store.setPromptTurnBoundary("chief", "telegram:10:99:70", "telegram-reply");
+  await store.setPromptContext("chief", "telegram:10:99:70", {
+    origin: "telegram",
+    chatId: 99,
+    replyToMessageId: 70,
+    awaitingCompletion: true,
+  });
+  await store.setDeliveryProgress("prompt:chief:telegram-prompt:telegram-reply", {
+    nextPart: 1,
+    claimed: true,
+  });
+
+  const reloaded = new JsonStateStore(filename);
+  await reloaded.load();
+  assert.equal(reloaded.getPromptTurnBoundary("chief", "telegram:10:99:70"), "telegram-reply");
+  assert.equal(reloaded.getPromptContext("chief", "telegram:10:99:70").awaitingCompletion, false);
+  assert.equal(reloaded.getPromptContext("chief", "telegram:10:99:70").replyToMessageId, 70);
+  assert.deepEqual(reloaded.getDeliveryProgress("prompt:chief:telegram-prompt:telegram-reply"), {
+    nextPart: 1,
+    claimed: true,
+  });
+
+  await reloaded.retirePromptTurn("chief", "telegram:10:99:70", "telegram-reply");
+  assert.equal(await reloaded.setPromptTurnBoundary("chief", "telegram:10:99:70", "later"), false);
+  assert.equal(reloaded.getPromptTurnBoundary("chief", "telegram:10:99:70"), undefined);
+});
+
 test("quarantines malformed state and starts cleanly", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-"));
   const filename = path.join(directory, "state.json");

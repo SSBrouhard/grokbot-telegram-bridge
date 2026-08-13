@@ -40,6 +40,10 @@ export class TelegramClient {
     return payload.result;
   }
 
+  splitMessage(text, limit = 4_000) {
+    return chunks(text, limit);
+  }
+
   getUpdates(offset, timeoutSeconds = 30, options = {}) {
     return this.call(
       "getUpdates",

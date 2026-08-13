@@ -20,6 +20,10 @@ function mirrorHarness(options = {}) {
   const state = {
     selected: new Map(),
     approvals: new Map(),
+    deliveries: new Map(),
+    promptBoundaries: new Map(),
+    promptContexts: new Map(),
+    retiredPromptTurns: new Map(),
     cursors: new Map(options.cursors ?? [["chief", { initialized: true, entryId: "old" }]]),
     enabled: options.enabled ?? true,
     getAgent(chatId) { return this.selected.get(chatId); },
@@ -30,11 +34,58 @@ function mirrorHarness(options = {}) {
     async setMirrorCursor(agentId, entryId) {
       this.cursors.set(agentId, { initialized: true, entryId: entryId ?? null });
     },
+    getPromptTurnBoundary(agentId, clientNonce) {
+      return this.promptBoundaries.get(`${agentId}:${clientNonce}`);
+    },
+    async setPromptTurnBoundary(agentId, clientNonce, entryId) {
+      const key = `${agentId}:${clientNonce}`;
+      if (this.retiredPromptTurns.has(key)) return false;
+      this.promptBoundaries.set(key, entryId);
+      return true;
+    },
+    async deletePromptTurnBoundary(agentId, clientNonce) {
+      this.promptBoundaries.delete(`${agentId}:${clientNonce}`);
+    },
+    listPromptTurnBoundaryAgentIds() {
+      return [...new Set([...this.promptBoundaries.keys()].map((key) => key.split(":", 1)[0]))];
+    },
+    listPromptTurnBoundaries(agentId) {
+      return [...this.promptBoundaries.entries()]
+        .filter(([key]) => key.startsWith(`${agentId}:`))
+        .map(([key, entryId]) => ({ clientNonce: key.slice(agentId.length + 1), entryId }));
+    },
+    async retirePromptTurn(agentId, clientNonce, entryId) {
+      const key = `${agentId}:${clientNonce}`;
+      this.promptBoundaries.delete(key);
+      this.retiredPromptTurns.set(key, entryId);
+      this.promptContexts.delete(key);
+    },
+    getPromptContext(agentId, clientNonce) {
+      return this.promptContexts.get(`${agentId}:${clientNonce}`);
+    },
+    listPromptContextAgentIds() {
+      return [...new Set([...this.promptContexts.keys()].map((key) => key.split(":", 1)[0]))];
+    },
+    listPromptContexts(agentId) {
+      return [...this.promptContexts.entries()]
+        .filter(([key]) => key.startsWith(`${agentId}:`))
+        .map(([key, context]) => ({ clientNonce: key.slice(agentId.length + 1), ...context }));
+    },
+    async setPromptContext(agentId, clientNonce, context) {
+      this.promptContexts.set(`${agentId}:${clientNonce}`, { ...context });
+    },
+    async deletePromptContext(agentId, clientNonce) {
+      this.promptContexts.delete(`${agentId}:${clientNonce}`);
+    },
     getApproval(token) { return this.approvals.get(token); },
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
+    getDeliveryProgress(key) { return this.deliveries.get(key); },
+    async setDeliveryProgress(key, progress) { this.deliveries.set(key, { ...progress }); },
+    async deleteDeliveryProgress(key) { this.deliveries.delete(key); },
   };
   const telegram = {
+    splitMessage(text) { return text.length > 4_096 ? text.match(/[\s\S]{1,4000}/g) : [text]; },
     async sendMessage(chatId, text, sendOptions = {}) {
       const record = { chatId, text, options: sendOptions, message_id: sent.length + 1 };
       sent.push(record);
@@ -521,4 +572,133 @@ test("mirror watcher exits when shutdown aborts its idle wait", async () => {
   setTimeout(() => controller.abort(), 5);
   await watcher;
   assert.equal(controller.signal.aborted, true);
+});
+
+test("delivers a Telegram reply once before separately mirroring scheduled output", async () => {
+  const harness = mirrorHarness();
+  harness.grok.sendPrompt = async (_agentId, _text, nonce) => {
+    harness.transcripts.get("chief").push({
+      id: "telegram-prompt",
+      kind: "message",
+      clientNonce: nonce,
+      message: { type: "text", content: "Do not mirror" },
+    });
+  };
+  harness.grok.waitForReply = async () => {
+    if (!harness.transcripts.get("chief").some((entry) => entry.id === "telegram-reply")) {
+      harness.transcripts.get("chief").push({
+        id: "telegram-reply",
+        kind: "send-message",
+        message: { type: "text", content: "Telegram response" },
+      });
+    }
+    return { messageId: "telegram-reply", text: "Telegram response", attachments: [] };
+  };
+
+  await harness.bridge.handleUpdate(command("Telegram question"));
+
+  assert.equal(harness.sent.filter(({ text }) => text === "Telegram response").length, 1);
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, 10);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "telegram-reply");
+  harness.transcripts.get("chief").push({
+    id: "scheduled-output",
+    kind: "send-message",
+    message: { type: "text", content: "Scheduled output" },
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.filter(({ text }) => text === "Telegram response").length, 1);
+  assert.equal(harness.sent.filter(({ text }) => /Scheduled output/.test(text)).length, 1);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "scheduled-output");
+});
+
+test("delivers authorized Telegram replies without an active desktop watcher", async () => {
+  for (const bridgeOptions of [{ configured: false }, { enabled: false }]) {
+    const harness = mirrorHarness(bridgeOptions);
+    harness.grok.sendPrompt = async (_agentId, text, clientNonce) => {
+      harness.transcripts.get("chief").push(
+        { id: "telegram-prompt", kind: "message", clientNonce, message: { type: "text", content: text } },
+        { id: "telegram-reply", kind: "send-message", message: { type: "text", content: "Direct reply" } },
+      );
+    };
+    harness.grok.waitForReply = async () => ({
+      messageId: "telegram-reply",
+      text: "Direct reply",
+      attachments: [],
+    });
+
+    await harness.bridge.handleUpdate(command("Question"));
+
+    assert.equal(harness.sent.at(-1).text, "Direct reply");
+    assert.equal(harness.sent.at(-1).chatId, 99);
+    assert.equal(harness.sent.at(-1).options.replyToMessageId, 10);
+  }
+});
+
+test("serializes prompt delivery between Telegram handling and mirror polling", async () => {
+  const harness = mirrorHarness();
+  let finishReply;
+  let replyWaitStarted;
+  const replyWait = new Promise((resolve) => { finishReply = resolve; });
+  const waitStarted = new Promise((resolve) => { replyWaitStarted = resolve; });
+  harness.grok.sendPrompt = async (_agentId, _text, clientNonce) => {
+    harness.transcripts.get("chief").push(
+      { id: "telegram-prompt", kind: "message", clientNonce, message: { type: "text", content: "Question" } },
+      { id: "telegram-reply", kind: "send-message", message: { type: "text", content: "One reply" } },
+    );
+  };
+  harness.grok.waitForReply = async () => {
+    replyWaitStarted();
+    await replyWait;
+    return { messageId: "telegram-reply", text: "One reply", attachments: [] };
+  };
+  let releaseSend;
+  let sendStarted;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  const sending = new Promise((resolve) => { sendStarted = resolve; });
+  const originalSend = harness.telegram.sendMessage;
+  harness.telegram.sendMessage = async (...args) => {
+    sendStarted();
+    await sendGate;
+    return originalSend(...args);
+  };
+
+  const handling = harness.bridge.handleUpdate(command("Question"));
+  await waitStarted;
+  await harness.bridge.pollDesktopMirrorOnce();
+  assert.deepEqual(harness.sent, []);
+  finishReply();
+  await sending;
+  const delivery = [...harness.state.deliveries.values()][0];
+  assert.equal(delivery.claimed, true);
+  const firstPoll = harness.bridge.pollDesktopMirrorOnce();
+  const concurrentPoll = harness.bridge.pollDesktopMirrorOnce();
+  releaseSend();
+  await Promise.all([handling, firstPoll, concurrentPoll]);
+
+  assert.equal(harness.sent.filter(({ text }) => text === "One reply").length, 1);
+  assert.equal(harness.sent[0].options.replyToMessageId, 10);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "telegram-reply");
+});
+
+test("routes ambiguous prompt output only to the configured mirror", async () => {
+  const harness = mirrorHarness();
+  const clientNonce = "telegram:2:88:20";
+  harness.state.promptContexts.set(`chief:${clientNonce}`, {
+    origin: "telegram",
+    chatId: 88,
+    replyToMessageId: 20,
+  });
+  harness.transcripts.get("chief").push(
+    { id: "other-chat-prompt", kind: "message", clientNonce, message: { type: "text", content: "Question" } },
+    { id: "ambiguous-update", kind: "send-message", message: { type: "text", content: "Private update" } },
+  );
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.length, 1);
+  assert.equal(harness.sent[0].chatId, 99);
+  assert.match(harness.sent[0].text, /^Grok update/);
+  assert.equal(harness.sent[0].options.replyToMessageId, undefined);
 });

@@ -164,6 +164,7 @@ export class Bridge {
       mirrorUserId,
     });
     this.firstWatchSnapshots = new Map();
+    this.agentMirrorQueues = new Map();
   }
 
   isAuthorized(message) {
@@ -472,43 +473,138 @@ export class Bridge {
       attachmentNames,
       richText,
     });
-    const reply = await this.grok.waitForReply(agent.id, clientNonce, {
+    await this.state.setPromptContext(agent.id, clientNonce, {
+      contextKey: clientNonce,
+      clientNonce,
+      origin: "telegram",
+      chatId,
+      replyToMessageId: message.message_id,
+      awaitingCompletion: true,
+    });
+    await this.waitForOwnedReply(agent.id, clientNonce, {
       ...options,
       onApproval: (entry) => this.sendApproval(chatId, agent.id, entry, {
         ...options,
         approvalUserId: message.from.id,
         replyToMessageId: message.message_id,
       }),
-    });
-    const replyOptions = { ...options, replyToMessageId: message.message_id };
-    if (reply.text) await this.telegram.sendMessage(chatId, reply.text, replyOptions);
-    for (const attachment of reply.attachments ?? []) {
-      const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
-      await this.telegram.sendAttachment(chatId, { ...attachment, bytes }, replyOptions);
-    }
+    }, this.mirrorEnabled() && chatId === this.mirrorChatId);
+    await this.deliverPromptContextThroughOwner(agent, clientNonce, options);
     await this.telegram.setMessageReaction?.(chatId, message.message_id, "✅", options).catch(() => {});
   }
 
   async pollDesktopMirrorOnce(options = {}) {
-    if (!this.mirrorEnabled()) return;
     const agents = await this.grok.listAgents(options);
+    const recoveryAgentIds = new Set();
+    for (const boundaryAgentId of this.state.listPromptTurnBoundaryAgentIds?.() ?? []) {
+      recoveryAgentIds.add(boundaryAgentId);
+    }
+    for (const contextAgentId of this.state.listPromptContextAgentIds?.() ?? []) {
+      recoveryAgentIds.add(contextAgentId);
+    }
+    if (!this.mirrorEnabled()) {
+      for (const recoveryAgentId of recoveryAgentIds) {
+        const recoveryAgent = agents.find((candidate) => candidate.id === recoveryAgentId);
+        if (!recoveryAgent) continue;
+        for (const context of this.state.listPromptContexts?.(recoveryAgentId) ?? []) {
+          const contextKey = context.contextKey ?? context.clientNonce;
+          await this.withAgentMirrorOwner(recoveryAgentId, () => this.deliverPromptContext(
+            recoveryAgent,
+            contextKey,
+            options,
+            undefined,
+            this.isMirrorConfigured(),
+          ));
+        }
+      }
+      return;
+    }
+    const recoveryErrors = new Map();
+    for (const recoveryAgentId of recoveryAgentIds) {
+      const recoveryAgent = agents.find((candidate) => candidate.id === recoveryAgentId);
+      if (!recoveryAgent) continue;
+      try {
+        await this.pollDesktopMirrorAgentOnce(recoveryAgent, options);
+      } catch (error) {
+        if (options.signal?.aborted || error.name === "AbortError") throw error;
+        recoveryErrors.set(recoveryAgentId, error);
+        console.error(`Desktop mirror recovery failed for ${recoveryAgentId}:`, error.message);
+      }
+    }
     const agent = this.resolveAgent(this.mirrorChatId, agents);
     if (!agent) throw new Error("Desktop mirror agent is unavailable");
+    if (recoveryAgentIds.has(agent.id)) {
+      if (recoveryErrors.has(agent.id)) throw recoveryErrors.get(agent.id);
+      return;
+    }
+    await this.pollDesktopMirrorAgentOnce(agent, options);
+  }
+
+  async pollDesktopMirrorAgentOnce(agent, options = {}) {
+    return this.withAgentMirrorOwner(agent.id, () => this.pollDesktopMirrorAgentOwned(agent, options));
+  }
+
+  async pollDesktopMirrorAgentOwned(agent, options = {}) {
     const baselineOptions = { ...options, agent };
-    if (await this.ensureMirrorBaseline(agent.id, baselineOptions)) return;
+    const promptContexts = this.state.listPromptContexts?.(agent.id) ?? [];
+    if (!promptContexts.length && await this.ensureMirrorBaseline(agent.id, baselineOptions)) return;
 
     let entries = await this.getTranscriptEntries(agent.id, options);
     const cursor = this.state.getMirrorCursor(agent.id);
-    let cursorIndex = cursor?.entryId === null
+    let cursorIndex = !cursor || cursor.entryId === null
       ? -1
-      : entries.findIndex((entry) => entry?.id === cursor?.entryId);
+      : entries.findIndex((entry) => entry?.id === cursor.entryId);
     if (cursor?.entryId && cursorIndex < 0) {
       entries = await this.grok.getTranscript(agent.id, options);
       cursorIndex = entries.findIndex((entry) => entry?.id === cursor.entryId);
       if (cursorIndex < 0) {
-        await this.ensureMirrorBaseline(agent.id, { ...baselineOptions, force: true });
+        if (!promptContexts.length) {
+          await this.ensureMirrorBaseline(agent.id, { ...baselineOptions, force: true });
+          return;
+        }
+        cursorIndex = -1;
+      }
+    }
+    for (const boundary of this.state.listPromptTurnBoundaries?.(agent.id) ?? []) {
+      const boundaryIndex = entries.findIndex((entry) => entry?.id === boundary.entryId);
+      if (boundaryIndex >= 0 && cursor && boundaryIndex <= cursorIndex) {
+        await this.retirePromptTurn(agent.id, boundary.clientNonce, boundary.entryId);
+      }
+    }
+    if (promptContexts.some((context) => !entries.some((entry) => isTopLevelPromptEntry(entry)
+      && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce)))) {
+      entries = await this.grok.getTranscript(agent.id, options);
+      cursorIndex = cursor?.entryId === null || !cursor
+        ? -1
+        : entries.findIndex((entry) => entry?.id === cursor?.entryId);
+    }
+    for (const context of promptContexts) {
+      const contextKey = context.contextKey ?? context.clientNonce;
+      const contextPromptIndex = entries.findIndex((entry) => isTopLevelPromptEntry(entry)
+        && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
+      if (contextPromptIndex >= 0 && (!cursor || contextPromptIndex <= cursorIndex)) {
+        await this.deliverRecoveredPromptEntries(
+          agent,
+          entries[contextPromptIndex],
+          { ...context, contextKey },
+          options,
+          Boolean(cursor),
+          entries,
+        );
         return;
       }
+    }
+    if (!this.state.getMirrorCursor(agent.id)) {
+      for (const context of promptContexts) {
+        await this.deliverPromptContext(
+          agent,
+          context.contextKey ?? context.clientNonce,
+          options,
+          undefined,
+          false,
+        );
+      }
+      return;
     }
     const unseen = entries.slice(cursorIndex + 1);
     if (!unseen.length) return;
@@ -541,29 +637,40 @@ export class Bridge {
         : !(reply.attachments ?? []).length
           ? "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it."
           : undefined;
-      let rootMessageId;
-      if (text) {
-        const sent = await this.telegram.sendMessage(this.mirrorChatId, text, options);
-        rootMessageId = sent?.message_id;
-      }
-      const replyOptions = Number.isSafeInteger(rootMessageId)
-        ? { ...options, replyToMessageId: rootMessageId }
-        : options;
-      for (const attachment of reply.attachments ?? []) {
-        const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
-        await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
-      }
+      const deliveryKey = `autonomous:${agent.id}:${entry.id}`;
+      await this.deliverTelegramParts({
+        deliveryKey,
+        chatId: this.mirrorChatId,
+        agentId: agent.id,
+        text,
+        attachments: reply.attachments,
+        options,
+      });
       await this.state.setMirrorCursor(agent.id, entry.id);
+      await this.state.deleteDeliveryProgress?.(deliveryKey);
     }
   }
 
   async mirrorDesktopTurn(agent, promptEntry, options = {}) {
     const clientNonce = typeof promptEntry?.clientNonce === "string" ? promptEntry.clientNonce : undefined;
+    const contextKey = clientNonce ?? promptEntry.id;
     const waitOptions = { ...options, promptEntryId: promptEntry.id };
+    const promptContext = this.state.getPromptContext?.(agent.id, contextKey);
+    if (promptContext) {
+      await this.deliverRecoveredPromptEntries(
+        agent,
+        promptEntry,
+        { ...promptContext, contextKey },
+        options,
+        true,
+      );
+      return;
+    }
     if (clientNonce?.startsWith("telegram:")) {
-      const skippedReply = await this.grok.waitForReply(agent.id, clientNonce, waitOptions);
+      const skippedReply = await this.waitForOwnedReply(agent.id, clientNonce, waitOptions, true);
       if (typeof skippedReply?.messageId === "string" && skippedReply.messageId) {
         await this.state.setMirrorCursor(agent.id, skippedReply.messageId);
+        await this.retirePromptTurn(agent.id, clientNonce, skippedReply.messageId);
       }
       return;
     }
@@ -585,6 +692,15 @@ export class Bridge {
     if (!Number.isSafeInteger(mirroredPrompt?.message_id)) {
       throw new Error("Telegram returned no message ID for the mirrored desktop prompt");
     }
+    await this.state.setPromptContext(agent.id, contextKey, {
+      contextKey,
+      clientNonce,
+      promptEntryId: promptEntry.id,
+      origin: "desktop",
+      chatId: this.mirrorChatId,
+      replyToMessageId: mirroredPrompt.message_id,
+      awaitingCompletion: true,
+    });
     const replyOptions = { ...options, replyToMessageId: mirroredPrompt.message_id };
     for (const attachment of prompt.attachments ?? []) {
       const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
@@ -594,28 +710,15 @@ export class Bridge {
         replyOptions,
       );
     }
-    const reply = await this.grok.waitForReply(agent.id, clientNonce, {
+    const reply = await this.waitForOwnedReply(agent.id, clientNonce, {
       ...waitOptions,
       onApproval: (entry) => this.sendApproval(this.mirrorChatId, agent.id, entry, {
         ...options,
         approvalUserId: this.mirrorUserId,
         replyToMessageId: mirroredPrompt.message_id,
       }),
-    });
-    if (reply.text) {
-      await this.telegram.sendMessage(this.mirrorChatId, reply.text, replyOptions);
-    }
-    for (const attachment of reply.attachments ?? []) {
-      const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
-      await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
-    }
-    if (!reply.text && !(reply.attachments ?? []).length) {
-      await this.telegram.sendMessage(this.mirrorChatId, "Grok completed without a Telegram-renderable response.", replyOptions);
-    }
-    if (typeof reply?.messageId !== "string" || !reply.messageId) {
-      throw new Error("Grok returned no transcript cursor for the mirrored desktop response");
-    }
-    await this.state.setMirrorCursor(agent.id, reply.messageId);
+    }, true, contextKey);
+    await this.deliverPromptContext(agent, contextKey, options, reply, true);
   }
 
   async runDesktopMirror(options = {}) {
@@ -640,6 +743,269 @@ export class Bridge {
         if (options.signal?.aborted || error.name === "AbortError") break;
         throw error;
       }
+    }
+  }
+
+  async waitForOwnedReply(agentId, clientNonce, options = {}, persistBoundary = false, contextKey = clientNonce) {
+    const completedReplyMessageId = typeof contextKey === "string"
+      ? this.state.getPromptTurnBoundary?.(agentId, contextKey)
+      : undefined;
+    let reply;
+    try {
+      reply = await this.grok.waitForReply(agentId, clientNonce, {
+        ...options,
+        ...(completedReplyMessageId ? { completedReplyMessageId } : {}),
+      });
+    } catch (error) {
+      const context = this.state.getPromptContext?.(agentId, contextKey);
+      if (context?.awaitingCompletion) {
+        await this.state.setPromptContext(agentId, contextKey, {
+          ...context,
+          awaitingCompletion: false,
+        });
+      }
+      throw error;
+    }
+    if (typeof contextKey === "string" && contextKey
+      && typeof reply?.messageId === "string" && reply.messageId) {
+      if (persistBoundary) {
+        await this.state.setPromptTurnBoundary?.(agentId, contextKey, reply.messageId);
+      }
+      const context = this.state.getPromptContext?.(agentId, contextKey);
+      if (context) {
+        await this.state.setPromptContext(agentId, contextKey, {
+          ...context,
+          awaitingCompletion: false,
+          completionEntryId: reply.messageId,
+          completionReply: {
+            messageId: reply.messageId,
+            text: reply.text,
+            attachments: reply.attachments ?? [],
+            entries: reply.entries,
+          },
+        });
+      }
+    }
+    return reply;
+  }
+
+  async retirePromptTurn(agentId, contextKey, entryId) {
+    if (typeof contextKey !== "string" || !contextKey) return;
+    if (this.state.retirePromptTurn) {
+      await this.state.retirePromptTurn(agentId, contextKey, entryId);
+    } else {
+      await this.state.deletePromptTurnBoundary?.(agentId, contextKey);
+    }
+    await this.state.deletePromptContext?.(agentId, contextKey);
+  }
+
+  async deliverRecoveredPromptEntries(
+    agent,
+    promptEntry,
+    context,
+    options = {},
+    advanceCursor = true,
+    resolvedEntries,
+  ) {
+    let entries = resolvedEntries ?? await this.getTranscriptEntries(agent.id, options);
+    if (context.awaitingCompletion) return 0;
+    let promptIndex = entries.findIndex((entry) => entry?.id === promptEntry.id);
+    if (promptIndex < 0) {
+      entries = await this.grok.getTranscript(agent.id, options);
+      promptIndex = entries.findIndex((entry) => entry?.id === promptEntry.id);
+    }
+    if (promptIndex < 0) return 0;
+    const nextPromptOffset = entries.slice(promptIndex + 1).findIndex(isTopLevelPromptEntry);
+    const turnEnd = nextPromptOffset < 0 ? entries.length : promptIndex + 1 + nextPromptOffset;
+    const replyEntries = entries.slice(promptIndex + 1, turnEnd)
+      .filter((entry) => entry?.kind === "send-message");
+    const contextKey = context.contextKey ?? promptEntry.clientNonce ?? promptEntry.id;
+    let delivered = 0;
+    for (const entry of replyEntries) {
+      if (typeof entry?.id !== "string" || !entry.id) {
+        throw new Error("Grok returned no transcript cursor for a recovered prompt update");
+      }
+      const alreadyDelivered = context.deliveredEntryIds?.includes(entry.id);
+      const reply = this.grok.getReplyContent([entry]);
+      const provenReply = entry.id === context.completionEntryId;
+      const neutral = !provenReply;
+      const text = reply.text
+        ? neutral ? `Grok update · ${agent.name}\n\n${reply.text}` : reply.text
+        : !(reply.attachments ?? []).length
+          ? "Grok produced an update that Telegram cannot render safely. Open Grok Bot to view it."
+          : undefined;
+      const deliveryKey = `prompt:${agent.id}:${promptEntry.id}:${entry.id}`;
+      const canDeliver = provenReply || this.isMirrorConfigured();
+      if (!alreadyDelivered && canDeliver) {
+        await this.deliverTelegramParts({
+          deliveryKey,
+          chatId: provenReply ? context.chatId ?? this.mirrorChatId : this.mirrorChatId,
+          agentId: agent.id,
+          text,
+          attachments: reply.attachments,
+          options: provenReply && context.replyToMessageId
+            ? { ...options, replyToMessageId: context.replyToMessageId }
+            : options,
+        });
+        context.deliveredEntryIds = [...(context.deliveredEntryIds ?? []), entry.id];
+        await this.state.setPromptContext?.(agent.id, contextKey, context);
+        await this.state.deleteDeliveryProgress?.(deliveryKey);
+        delivered += 1;
+      }
+      if (advanceCursor && canDeliver) await this.state.setMirrorCursor(agent.id, entry.id);
+      if (entry.id === context.completionEntryId) {
+        await this.retirePromptTurn(agent.id, contextKey, entry.id);
+        break;
+      }
+    }
+    if (advanceCursor && !context.completionEntryId && nextPromptOffset >= 0) {
+      if (!replyEntries.length) await this.state.setMirrorCursor(agent.id, promptEntry.id);
+      await this.retirePromptTurn(agent.id, contextKey, replyEntries.at(-1)?.id ?? promptEntry.id);
+    }
+    return delivered;
+  }
+
+  async withAgentMirrorOwner(agentId, operation) {
+    const previous = this.agentMirrorQueues.get(agentId) ?? Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    this.agentMirrorQueues.set(agentId, current);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.agentMirrorQueues.get(agentId) === current) this.agentMirrorQueues.delete(agentId);
+    }
+  }
+
+  async deliverPromptContextThroughOwner(agent, contextKey, options = {}) {
+    return this.withAgentMirrorOwner(agent.id, async () => {
+      if (!this.mirrorEnabled()) {
+        return this.deliverPromptContext(
+          agent,
+          contextKey,
+          options,
+          undefined,
+          this.isMirrorConfigured(),
+        );
+      }
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (!this.state.getPromptContext?.(agent.id, contextKey)) return;
+        const before = this.state.getMirrorCursor(agent.id)?.entryId;
+        await this.pollDesktopMirrorAgentOwned(agent, options);
+        if (!this.state.getPromptContext?.(agent.id, contextKey)) return;
+        if (this.state.getMirrorCursor(agent.id)?.entryId === before) {
+          return this.deliverPromptContext(agent, contextKey, options, undefined, true);
+        }
+      }
+    });
+  }
+
+  async deliverPromptContext(agent, contextKey, options = {}, liveReply, advanceCursor = true) {
+    const context = this.state.getPromptContext?.(agent.id, contextKey);
+    if (!context) return;
+    let entries = [];
+    try {
+      entries = await this.getTranscriptEntries(agent.id, options);
+    } catch {
+      entries = [];
+    }
+    let promptEntry = entries.find((entry) => isTopLevelPromptEntry(entry)
+      && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
+    if (!promptEntry && typeof this.grok.getTranscript === "function") {
+      try {
+        entries = await this.grok.getTranscript(agent.id, options);
+        promptEntry = entries.find((entry) => isTopLevelPromptEntry(entry)
+          && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
+      } catch {
+        entries = [];
+      }
+    }
+    const replyResult = liveReply ?? context.completionReply;
+    if (!promptEntry && replyResult?.messageId) {
+      promptEntry = {
+        id: context.promptEntryId ?? `prompt:${contextKey}`,
+        kind: "message",
+        clientNonce: context.clientNonce,
+      };
+      entries.push(promptEntry);
+    }
+    if (!promptEntry) return;
+    if (replyResult?.messageId && !entries.some((entry) => entry?.id === replyResult.messageId)) {
+      entries.push(...this.replyEntriesFromResult(replyResult));
+    }
+    await this.deliverRecoveredPromptEntries(
+      agent,
+      promptEntry,
+      { ...context, contextKey },
+      options,
+      advanceCursor,
+      entries,
+    );
+  }
+
+  replyEntriesFromResult(reply) {
+    if (reply?.entries?.length) return reply.entries;
+    if (!reply?.messageId) return [];
+    return [{
+      id: reply.messageId,
+      kind: "send-message",
+      message: {
+        type: "text",
+        content: reply.text ?? "",
+        images: (reply.attachments ?? []).map((attachment) => ({
+          url: attachment.path,
+          alt: attachment.caption,
+        })),
+      },
+    }];
+  }
+
+  async findTranscriptEntryByNonce(agentId, clientNonce, options = {}) {
+    let entries = await this.getTranscriptEntries(agentId, options);
+    let entry = entries.find((candidate) => candidate?.clientNonce === clientNonce);
+    if (entry) return entry;
+    entries = await this.grok.getTranscript(agentId, options);
+    return entries.find((candidate) => candidate?.clientNonce === clientNonce);
+  }
+
+  async deliverTelegramParts({ deliveryKey, chatId, agentId, text, attachments = [], options = {} }) {
+    const parts = [
+      ...(text ? [{ type: "text", text }] : []),
+      ...attachments.map((attachment) => ({ type: "attachment", attachment })),
+    ];
+    let progress = this.state.getDeliveryProgress?.(deliveryKey);
+    if (!progress) {
+      progress = { nextPart: 0, claimed: true };
+      await this.state.setDeliveryProgress?.(deliveryKey, progress);
+    }
+    for (let index = progress.nextPart; index < parts.length; index += 1) {
+      const part = parts[index];
+      if (part.type === "text") {
+        const textChunks = this.telegram.splitMessage?.(part.text) ?? [part.text];
+        for (let chunkIndex = progress.nextTextChunk ?? 0; chunkIndex < textChunks.length; chunkIndex += 1) {
+          const sent = await this.telegram.sendMessage(chatId, textChunks[chunkIndex], {
+            ...options,
+            ...(chunkIndex === textChunks.length - 1 ? {} : { inlineKeyboard: undefined }),
+          });
+          if (!options.replyToMessageId && !Number.isSafeInteger(progress.rootMessageId)
+            && Number.isSafeInteger(sent?.message_id)) {
+            progress.rootMessageId = sent.message_id;
+          }
+          progress.nextTextChunk = chunkIndex + 1;
+          await this.state.setDeliveryProgress?.(deliveryKey, progress);
+        }
+        delete progress.nextTextChunk;
+      } else {
+        const bytes = await this.grok.readAttachment(agentId, part.attachment.path, options);
+        const attachmentOptions = Number.isSafeInteger(progress.rootMessageId)
+          ? { ...options, replyToMessageId: progress.rootMessageId }
+          : options;
+        await this.telegram.sendAttachment(chatId, { ...part.attachment, bytes }, attachmentOptions);
+      }
+      progress.nextPart = index + 1;
+      await this.state.setDeliveryProgress?.(deliveryKey, progress);
     }
   }
 
