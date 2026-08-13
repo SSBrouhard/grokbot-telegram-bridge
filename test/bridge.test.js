@@ -54,6 +54,7 @@ function makeHarness() {
     async setOffset(offset) { this.offset = offset; },
     approvals: new Map(),
     getApproval(token) { return this.approvals.get(token); },
+    listApprovals() { return [...this.approvals.entries()]; },
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
     getPromptContext(agentId, clientNonce) {

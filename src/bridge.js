@@ -20,11 +20,15 @@ const HELP = [
   "/help - show this help",
   "",
   "Telegram attachments are limited to 20 MB. Supported approvals offer only Approve once or Deny.",
+  "Telegram-safe routine choice cards are one-time actions and expire in 12 hours.",
 ].join("\n");
 
 const APPROVAL_TTL_MS = 10 * 60_000;
+const ROUTINE_WIDGET_TTL_MS = 12 * 60 * 60_000;
 const APPROVAL_TEXT_LIMIT = 3_500;
 const SKILL_LIST_LIMIT = 20;
+const ROUTINE_WIDGET_CALLBACK = /^gtw:([A-Za-z0-9_-]{24}):([0-9a-z])$/;
+const ROUTINE_WIDGET_NONCE = /^telegram:widget:([A-Za-z0-9_-]{24}):[0-9a-z]$/;
 
 function approvalDetails(entry) {
   if (entry?.message?.type === "auto-review-approval") {
@@ -56,6 +60,32 @@ function approvalDetails(entry) {
     };
   }
   return undefined;
+}
+
+function telegramSafeRoutineWidget(entry) {
+  if (entry?.kind !== "send-message" || entry.message?.type !== "widget") return undefined;
+  const widget = entry.message.widget;
+  if (!widget || typeof widget.prompt !== "string" || !widget.prompt.trim()) return undefined;
+  if (!Array.isArray(widget.options) || widget.options.length < 1 || widget.options.length > 10) {
+    return undefined;
+  }
+  const choices = [];
+  for (const option of widget.options) {
+    if (typeof option?.label !== "string" || !option.label.trim()) return undefined;
+    if (typeof option?.value !== "string" || !option.value.trim()) return undefined;
+    choices.push({
+      label: option.label.trim().slice(0, 64),
+      value: option.value,
+    });
+  }
+  const helpText = typeof widget.helpText === "string" ? widget.helpText.trim() : "";
+  const text = [widget.prompt.trim(), helpText].filter(Boolean).join("\n\n");
+  if (!text || text.length > APPROVAL_TEXT_LIMIT) return undefined;
+  return { text, choices };
+}
+
+function routineWidgetNonce(token, choiceIndex) {
+  return `telegram:widget:${token}:${choiceIndex.toString(36)}`;
 }
 
 function formatApproval(details) {
@@ -165,6 +195,7 @@ export class Bridge {
     });
     this.firstWatchSnapshots = new Map();
     this.agentMirrorQueues = new Map();
+    this.widgetCallbackQueues = new Map();
   }
 
   isAuthorized(message) {
@@ -502,6 +533,11 @@ export class Bridge {
     for (const contextAgentId of this.state.listPromptContextAgentIds?.() ?? []) {
       recoveryAgentIds.add(contextAgentId);
     }
+    for (const [, widget] of this.listRoutineWidgets()) {
+      if (widget.submissionIntent === true && widget.replyDelivered !== true && widget.agentId) {
+        recoveryAgentIds.add(widget.agentId);
+      }
+    }
     if (!this.mirrorEnabled()) {
       for (const recoveryAgentId of recoveryAgentIds) {
         const recoveryAgent = agents.find((candidate) => candidate.id === recoveryAgentId);
@@ -546,6 +582,7 @@ export class Bridge {
 
   async pollDesktopMirrorAgentOwned(agent, options = {}) {
     const baselineOptions = { ...options, agent };
+    await this.reconcileRoutineWidgetSubmissions(agent.id, options);
     const promptContexts = this.state.listPromptContexts?.(agent.id) ?? [];
     if (!promptContexts.length && await this.ensureMirrorBaseline(agent.id, baselineOptions)) return;
 
@@ -583,14 +620,7 @@ export class Bridge {
       const contextPromptIndex = entries.findIndex((entry) => isTopLevelPromptEntry(entry)
         && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
       if (contextPromptIndex >= 0 && (!cursor || contextPromptIndex <= cursorIndex)) {
-        await this.deliverRecoveredPromptEntries(
-          agent,
-          entries[contextPromptIndex],
-          { ...context, contextKey },
-          options,
-          Boolean(cursor),
-          entries,
-        );
+        await this.deliverPromptContext(agent, contextKey, options, undefined, Boolean(cursor));
         return;
       }
     }
@@ -631,23 +661,28 @@ export class Bridge {
       if (typeof entry?.id !== "string" || !entry.id) {
         throw new Error("Grok returned no transcript cursor for autonomous output");
       }
-      const reply = this.grok.getReplyContent([entry]);
-      const text = reply.text
-        ? `⏰ Routine · ${agent.name}\n\n${reply.text}`
-        : !(reply.attachments ?? []).length
-          ? "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it."
-          : undefined;
-      const deliveryKey = `autonomous:${agent.id}:${entry.id}`;
-      await this.deliverTelegramParts({
-        deliveryKey,
-        chatId: this.mirrorChatId,
-        agentId: agent.id,
-        text,
-        attachments: reply.attachments,
-        options,
-      });
+      const widget = telegramSafeRoutineWidget(entry);
+      if (widget && this.isMirrorConfigured()) {
+        await this.sendAutonomousRoutineWidget(agent, entry, widget, options);
+      } else {
+        const reply = this.grok.getReplyContent([entry]);
+        const text = reply.text
+          ? `⏰ Routine · ${agent.name}\n\n${reply.text}`
+          : !(reply.attachments ?? []).length
+            ? "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it."
+            : undefined;
+        const deliveryKey = `autonomous:${agent.id}:${entry.id}`;
+        await this.deliverTelegramParts({
+          deliveryKey,
+          chatId: this.mirrorChatId,
+          agentId: agent.id,
+          text,
+          attachments: reply.attachments,
+          options,
+        });
+        await this.state.deleteDeliveryProgress?.(deliveryKey);
+      }
       await this.state.setMirrorCursor(agent.id, entry.id);
-      await this.state.deleteDeliveryProgress?.(deliveryKey);
     }
   }
 
@@ -657,13 +692,7 @@ export class Bridge {
     const waitOptions = { ...options, promptEntryId: promptEntry.id };
     const promptContext = this.state.getPromptContext?.(agent.id, contextKey);
     if (promptContext) {
-      await this.deliverRecoveredPromptEntries(
-        agent,
-        promptEntry,
-        { ...promptContext, contextKey },
-        options,
-        true,
-      );
+      await this.deliverPromptContext(agent, contextKey, options, undefined, true);
       return;
     }
     if (clientNonce?.startsWith("telegram:")) {
@@ -797,6 +826,13 @@ export class Bridge {
       await this.state.deletePromptTurnBoundary?.(agentId, contextKey);
     }
     await this.state.deletePromptContext?.(agentId, contextKey);
+    const widgetToken = ROUTINE_WIDGET_NONCE.exec(contextKey)?.[1];
+    const widget = widgetToken ? this.state.getApproval(widgetToken) : undefined;
+    if (widget?.type === "routine-widget" && widget.agentId === agentId) {
+      widget.replyDelivered = true;
+      widget.resolving = false;
+      await this.state.setApproval(widgetToken, widget);
+    }
   }
 
   async deliverRecoveredPromptEntries(
@@ -905,6 +941,7 @@ export class Bridge {
   async deliverPromptContext(agent, contextKey, options = {}, liveReply, advanceCursor = true) {
     const context = this.state.getPromptContext?.(agent.id, contextKey);
     if (!context) return;
+    const clientNonce = context.clientNonce ?? context.contextKey ?? contextKey;
     let entries = [];
     try {
       entries = await this.getTranscriptEntries(agent.id, options);
@@ -912,12 +949,12 @@ export class Bridge {
       entries = [];
     }
     let promptEntry = entries.find((entry) => isTopLevelPromptEntry(entry)
-      && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
+      && (entry?.id === context.promptEntryId || entry?.clientNonce === clientNonce));
     if (!promptEntry && typeof this.grok.getTranscript === "function") {
       try {
         entries = await this.grok.getTranscript(agent.id, options);
         promptEntry = entries.find((entry) => isTopLevelPromptEntry(entry)
-          && (entry?.id === context.promptEntryId || entry?.clientNonce === context.clientNonce));
+          && (entry?.id === context.promptEntryId || entry?.clientNonce === clientNonce));
       } catch {
         entries = [];
       }
@@ -927,18 +964,33 @@ export class Bridge {
       promptEntry = {
         id: context.promptEntryId ?? `prompt:${contextKey}`,
         kind: "message",
-        clientNonce: context.clientNonce,
+        clientNonce,
       };
       entries.push(promptEntry);
     }
     if (!promptEntry) return;
-    if (replyResult?.messageId && !entries.some((entry) => entry?.id === replyResult.messageId)) {
-      entries.push(...this.replyEntriesFromResult(replyResult));
+    if (!replyResult?.messageId
+      && ROUTINE_WIDGET_NONCE.test(clientNonce ?? "")
+      && !context.awaitingCompletion) {
+      await this.waitForOwnedReply(agent.id, clientNonce, {
+        ...options,
+        promptEntryId: context.promptEntryId ?? promptEntry.id,
+        onApproval: (entry) => this.sendApproval(context.chatId ?? this.mirrorChatId, agent.id, entry, {
+          ...options,
+          approvalUserId: this.mirrorUserId,
+          replyToMessageId: context.replyToMessageId,
+        }),
+      }, advanceCursor && this.mirrorEnabled(), contextKey);
+    }
+    const completed = this.state.getPromptContext?.(agent.id, contextKey) ?? context;
+    const completedReply = liveReply ?? completed.completionReply;
+    if (completedReply?.messageId && !entries.some((entry) => entry?.id === completedReply.messageId)) {
+      entries.push(...this.replyEntriesFromResult(completedReply));
     }
     await this.deliverRecoveredPromptEntries(
       agent,
       promptEntry,
-      { ...context, contextKey },
+      { ...completed, contextKey, clientNonce },
       options,
       advanceCursor,
       entries,
@@ -1009,6 +1061,238 @@ export class Bridge {
     }
   }
 
+  listRoutineWidgets() {
+    const entries = typeof this.state.listApprovals === "function"
+      ? this.state.listApprovals()
+      : Object.entries(this.state.pendingApprovals ?? {});
+    return entries.filter(([, approval]) => approval?.type === "routine-widget");
+  }
+
+  findRoutineWidget(agentId, entryId) {
+    return this.listRoutineWidgets().find(([, widget]) => (
+      widget.agentId === agentId && widget.entryId === entryId
+    ));
+  }
+
+  async withWidgetCallbackLock(token, operation) {
+    const previous = this.widgetCallbackQueues.get(token) ?? Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    this.widgetCallbackQueues.set(token, current);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.widgetCallbackQueues.get(token) === current) this.widgetCallbackQueues.delete(token);
+    }
+  }
+
+  routineWidgetBindingError(widget, callback, token, choiceIndex) {
+    const choice = widget?.choices?.[choiceIndex];
+    if (!widget || widget.type !== "routine-widget" || !widget.agentId || !widget.entryId
+      || !choice || typeof choice.value !== "string" || !choice.value
+      || widget.chatId !== this.mirrorChatId
+      || widget.userId !== this.mirrorUserId
+      || widget.chatId !== callback.message?.chat?.id
+      || widget.userId !== callback.from?.id
+      || widget.messageId !== callback.message?.message_id) {
+      return "This option is not valid for this chat.";
+    }
+    if (widget.replyDelivered === true) {
+      return "That widget choice was already used.";
+    }
+    if (widget.submissionIntent === true) {
+      const expectedNonce = routineWidgetNonce(token, choiceIndex);
+      if (widget.choiceIndex !== choiceIndex
+        || widget.clientNonce !== expectedNonce
+        || widget.selectedValue !== choice.value) {
+        return "That widget choice was already used.";
+      }
+    } else if (widget.expiresAt <= Date.now()) {
+      return "expired";
+    }
+    return undefined;
+  }
+
+  async sendAutonomousRoutineWidget(agent, entry, details, options = {}) {
+    const cardText = `⏰ Routine · ${agent.name}\n\n${details.text}`;
+    if (cardText.length > APPROVAL_TEXT_LIMIT) {
+      await this.telegram.sendMessage(
+        this.mirrorChatId,
+        "Grok Bot needs an approval, secret, or rich interaction. Open Grok Bot on desktop to handle it safely.",
+        options,
+      );
+      return;
+    }
+    const existing = this.findRoutineWidget(agent.id, entry.id);
+    if (existing?.[1]?.messageId) return;
+    const token = existing?.[0] ?? randomBytes(18).toString("base64url");
+    const widget = existing?.[1] ?? {
+      type: "routine-widget",
+      agentId: agent.id,
+      entryId: entry.id,
+      choices: details.choices,
+      chatId: this.mirrorChatId,
+      userId: this.mirrorUserId,
+      expiresAt: Date.now() + ROUTINE_WIDGET_TTL_MS,
+    };
+    if (!existing) await this.state.setApproval(token, widget);
+    try {
+      const sent = await this.telegram.sendMessage(this.mirrorChatId, cardText, {
+        ...options,
+        inlineKeyboard: details.choices.map((choice, index) => [{
+          text: choice.label,
+          callback_data: `gtw:${token}:${index.toString(36)}`,
+        }]),
+      });
+      widget.messageId = sent?.message_id;
+      await this.state.setApproval(token, widget);
+    } catch (error) {
+      if (!existing) await this.state.deleteApproval(token);
+      throw error;
+    }
+  }
+
+  async reconcileRoutineWidgetSubmissions(agentId, options = {}) {
+    const pending = this.listRoutineWidgets().filter(([, widget]) => (
+      widget.agentId === agentId
+      && widget.submissionIntent === true
+      && typeof widget.clientNonce === "string"
+      && widget.clientNonce
+    ));
+    if (!pending.length) return;
+    let entries = await this.getTranscriptEntries(agentId, options);
+    if (pending.some(([, widget]) => !entries.some((entry) => (
+      isTopLevelPromptEntry(entry) && entry?.clientNonce === widget.clientNonce
+    )))) {
+      entries = await this.grok.getTranscript(agentId, options);
+    }
+    for (const [token, widget] of pending) {
+      const promptEntry = entries.find((entry) => (
+        isTopLevelPromptEntry(entry) && entry?.clientNonce === widget.clientNonce
+      ));
+      if (!promptEntry) continue;
+      widget.submitted = true;
+      widget.accepted = true;
+      widget.resolving = false;
+      await this.state.setApproval(token, widget);
+      if (!this.state.getPromptContext?.(agentId, widget.clientNonce)) {
+        await this.state.setPromptContext(agentId, widget.clientNonce, {
+          contextKey: widget.clientNonce,
+          clientNonce: widget.clientNonce,
+          promptEntryId: promptEntry.id,
+          origin: "telegram",
+          chatId: widget.chatId,
+          replyToMessageId: widget.messageId,
+          awaitingCompletion: false,
+        });
+      }
+    }
+  }
+
+  async deliverAcceptedWidgetChoice(token, widget, options = {}) {
+    const agents = await this.grok.listAgents(options);
+    const agent = agents.find((candidate) => candidate.id === widget.agentId)
+      ?? { id: widget.agentId, name: "Grok" };
+    const persistBoundary = this.mirrorEnabled();
+    if (!this.state.getPromptContext?.(agent.id, widget.clientNonce)) {
+      await this.state.setPromptContext(agent.id, widget.clientNonce, {
+        contextKey: widget.clientNonce,
+        clientNonce: widget.clientNonce,
+        origin: "telegram",
+        chatId: widget.chatId,
+        replyToMessageId: widget.messageId,
+        awaitingCompletion: true,
+      });
+    }
+    await this.waitForOwnedReply(agent.id, widget.clientNonce, {
+      ...options,
+      onApproval: (entry) => this.sendApproval(widget.chatId, agent.id, entry, {
+        ...options,
+        approvalUserId: widget.userId,
+        replyToMessageId: widget.messageId,
+      }),
+    }, persistBoundary);
+    await this.deliverPromptContextThroughOwner(agent, widget.clientNonce, options);
+    widget.replyDelivered = true;
+    widget.resolving = false;
+    await this.state.setApproval(token, widget);
+  }
+
+  async handleRoutineWidgetCallback(callback, token, choiceIndex, options = {}) {
+    return this.withWidgetCallbackLock(token, async () => {
+      const widget = this.state.getApproval(token);
+      const bindingError = this.routineWidgetBindingError(widget, callback, token, choiceIndex);
+      if (bindingError === "expired") {
+        await this.state.deleteApproval(token);
+        await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
+        await this.telegram.answerCallbackQuery(
+          callback.id,
+          "This option expired. Open Grok Bot if you still need to choose.",
+          options,
+        );
+        return;
+      }
+      if (bindingError) {
+        await this.telegram.answerCallbackQuery(callback.id, bindingError, options);
+        return;
+      }
+      if (widget.resolving) {
+        await this.telegram.answerCallbackQuery(callback.id, "That choice is already being processed.", options);
+        return;
+      }
+
+      const choice = widget.choices[choiceIndex];
+      const clientNonce = routineWidgetNonce(token, choiceIndex);
+      if (widget.submissionIntent === true) {
+        const submittedEntry = await this.findTranscriptEntryByNonce(widget.agentId, clientNonce, options);
+        if (!submittedEntry) {
+          await this.telegram.answerCallbackQuery(
+            callback.id,
+            "Choice submission is still being reconciled. It will not be sent twice.",
+            options,
+          );
+          return;
+        }
+        widget.submitted = true;
+        widget.accepted = true;
+        widget.resolving = true;
+        await this.state.setApproval(token, widget);
+        try {
+          await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
+          await this.telegram.answerCallbackQuery(callback.id, "Sent to Grok.", options).catch(() => {});
+          await this.deliverAcceptedWidgetChoice(token, widget, options);
+        } catch (error) {
+          widget.resolving = false;
+          await this.state.setApproval(token, widget);
+          throw error;
+        }
+        return;
+      }
+
+      widget.resolving = true;
+      widget.submissionIntent = true;
+      widget.clientNonce = clientNonce;
+      widget.choiceIndex = choiceIndex;
+      widget.selectedValue = choice.value;
+      await this.state.setApproval(token, widget);
+      try {
+        await this.grok.sendPrompt(widget.agentId, choice.value, clientNonce, options);
+        widget.submitted = true;
+        widget.accepted = true;
+        await this.state.setApproval(token, widget);
+        await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
+        await this.telegram.answerCallbackQuery(callback.id, "Sent to Grok.", options).catch(() => {});
+        await this.deliverAcceptedWidgetChoice(token, widget, options);
+      } catch (error) {
+        widget.resolving = false;
+        await this.state.setApproval(token, widget);
+        throw error;
+      }
+    });
+  }
+
   async sendApproval(chatId, agentId, entry, options = {}) {
     const details = approvalDetails(entry);
     if (!details?.requestId || !entry?.id) return;
@@ -1052,6 +1336,16 @@ export class Bridge {
   async handleCallbackQuery(update, options = {}) {
     const callback = update?.callback_query;
     if (!this.isAuthorizedCallback(callback)) return;
+    const widgetMatch = ROUTINE_WIDGET_CALLBACK.exec(callback.data ?? "");
+    if (widgetMatch) {
+      await this.handleRoutineWidgetCallback(
+        callback,
+        widgetMatch[1],
+        Number.parseInt(widgetMatch[2], 36),
+        options,
+      );
+      return;
+    }
     const match = /^gta:([A-Za-z0-9_-]{24}):([ad])$/.exec(callback.data ?? "");
     if (!match) {
       await this.telegram.answerCallbackQuery(callback.id, "Unknown or invalid approval.", options);
@@ -1130,9 +1424,16 @@ export class Bridge {
   async handleCallbackError(update, options = {}) {
     const callback = update?.callback_query;
     if (!this.isAuthorizedCallback(callback)) return;
+    const widgetMatch = ROUTINE_WIDGET_CALLBACK.exec(callback.data ?? "");
+    const widget = widgetMatch ? this.state.getApproval(widgetMatch[1]) : undefined;
+    const choiceWasSent = widget?.type === "routine-widget" && widget.submissionIntent === true;
     await this.telegram.answerCallbackQuery(
       callback.id,
-      "Could not apply that decision. The request remains unapproved.",
+      choiceWasSent
+        ? "Choice sent. Reply delivery will retry automatically."
+        : widgetMatch
+          ? "Could not finish that choice. Check the chat before trying again."
+          : "Could not apply that decision. The request remains unapproved.",
       options,
     ).catch(() => {});
   }

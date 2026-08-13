@@ -78,6 +78,7 @@ function mirrorHarness(options = {}) {
       this.promptContexts.delete(`${agentId}:${clientNonce}`);
     },
     getApproval(token) { return this.approvals.get(token); },
+    listApprovals() { return [...this.approvals.entries()]; },
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
     getDeliveryProgress(key) { return this.deliveries.get(key); },
@@ -249,26 +250,447 @@ test("does not skip an unidentified autonomous entry before an identified one", 
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "old");
 });
 
-test("sends the Open Grok Bot handoff for autonomous widgets without offering a choice", async () => {
+test("sends the Open Grok Bot handoff for unsafe autonomous widgets", async () => {
   const harness = mirrorHarness();
   let promptCount = 0;
   harness.grok.sendPrompt = async () => { promptCount += 1; };
-  harness.transcripts.get("chief").push({
-    id: "routine-widget",
+  const unsafeWidgets = [
+    {
+      id: "missing-value",
+      widget: {
+        prompt: "Approve today's must-win?",
+        options: [{ label: "Draft follow-up" }],
+      },
+    },
+    {
+      id: "empty-prompt",
+      widget: {
+        prompt: "   ",
+        options: [{ label: "Continue", value: "Continue" }],
+      },
+    },
+    {
+      id: "too-many-options",
+      widget: {
+        prompt: "Pick one",
+        options: Array.from({ length: 11 }, (_, index) => ({
+          label: `Option ${index + 1}`,
+          value: `value-${index + 1}`,
+        })),
+      },
+    },
+  ];
+  for (const { id, widget } of unsafeWidgets) {
+    harness.transcripts.get("chief").push({
+      id,
+      kind: "send-message",
+      message: { type: "widget", widget },
+    });
+  }
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.length, 3);
+  assert.ok(harness.sent.every((message) => /Open Grok Bot/.test(message.text)));
+  assert.ok(harness.sent.every((message) => message.options.inlineKeyboard === undefined));
+  assert.equal(promptCount, 0);
+  assert.equal(harness.state.approvals.size, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "too-many-options");
+});
+
+function safeRoutineWidget(id = "routine-widget") {
+  return {
+    id,
     kind: "send-message",
-    message: { type: "widget", widget: {
-      prompt: "Approve today's must-win?",
-      options: [{ label: "Draft follow-up", value: "Approve RF-1 draft follow-up" }],
-    } },
+    message: {
+      type: "widget",
+      widget: {
+        prompt: "Approve today's must-win?",
+        helpText: "Proposal-only. Nothing is sent until you choose.",
+        options: [
+          { label: "Draft follow-up", value: "Approve RF-1 draft follow-up" },
+          { label: "Skip today", value: "Skip RF-1" },
+        ],
+      },
+    },
+  };
+}
+
+function widgetCallback(harness, data, overrides = {}) {
+  return {
+    callback_query: {
+      id: "widget-callback",
+      data,
+      from: { id: 42 },
+      message: {
+        message_id: harness.sent.find((message) => message.options.inlineKeyboard)?.message_id ?? 1,
+        chat: { id: 99, type: "private" },
+      },
+      ...overrides,
+    },
+  };
+}
+
+test("binds a safe routine widget to the mirror identity and submits the exact selected option", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  const card = harness.sent[0];
+  assert.match(card.text, /Approve today's must-win/);
+  assert.deepEqual(card.options.inlineKeyboard.map((row) => row[0].text), [
+    "Draft follow-up",
+    "Skip today",
+  ]);
+  const data = card.options.inlineKeyboard[0][0].callback_data;
+  const token = /^gtw:([^:]+):/.exec(data)[1];
+  const binding = harness.state.getApproval(token);
+  assert.equal(binding.type, "routine-widget");
+  assert.equal(binding.agentId, "chief");
+  assert.equal(binding.entryId, "routine-widget");
+  assert.equal(binding.chatId, 99);
+  assert.equal(binding.userId, 42);
+  assert.equal(binding.messageId, card.message_id);
+  assert.equal(binding.choices[0].value, "Approve RF-1 draft follow-up");
+  assert.ok(binding.expiresAt > Date.now());
+
+  let submitted;
+  harness.grok.sendPrompt = async (agentId, text, nonce) => {
+    submitted = { agentId, text, nonce };
+    harness.transcripts.get("chief").push({
+      id: "widget-prompt",
+      kind: "message",
+      clientNonce: nonce,
+      message: { type: "text", content: text },
+    });
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Draft ready for review.",
+    attachments: [],
+  });
+
+  await harness.bridge.handleCallbackQuery(widgetCallback(harness, data));
+
+  assert.deepEqual(submitted, {
+    agentId: "chief",
+    text: "Approve RF-1 draft follow-up",
+    nonce: `telegram:widget:${token}:0`,
+  });
+  assert.equal(harness.callbackAnswers.at(-1).text, "Sent to Grok.");
+  assert.deepEqual(harness.markupEdits.at(-1).inlineKeyboard, []);
+  assert.equal(harness.sent.at(-1).text, "Draft ready for review.");
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, card.message_id);
+  assert.equal(harness.state.getApproval(token).replyDelivered, true);
+});
+
+test("rejects a repeat widget click without sending another prompt", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async (_agentId, text, nonce) => {
+    submissionCount += 1;
+    harness.transcripts.get("chief").push({
+      id: "widget-prompt",
+      kind: "message",
+      clientNonce: nonce,
+      message: { type: "text", content: text },
+    });
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Done",
+    attachments: [],
+  });
+
+  await harness.bridge.handleCallbackQuery(widgetCallback(harness, data));
+  await harness.bridge.handleCallbackQuery(widgetCallback(harness, data, { id: "repeat" }));
+
+  assert.equal(submissionCount, 1);
+  assert.match(harness.callbackAnswers.at(-1).text, /already used/);
+});
+
+test("rejects widget callbacks from a different user, chat, or stale message", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  let promptCount = 0;
+  harness.grok.sendPrompt = async () => { promptCount += 1; };
+
+  for (const callback of [
+    { from: { id: 7 }, message: { message_id: harness.sent[0].message_id, chat: { id: 99, type: "private" } } },
+    { from: { id: 42 }, message: { message_id: harness.sent[0].message_id, chat: { id: 88, type: "private" } } },
+    { from: { id: 42 }, message: { message_id: 999, chat: { id: 99, type: "private" } } },
+  ]) {
+    await harness.bridge.handleCallbackQuery({ callback_query: { id: "invalid", data, ...callback } });
+  }
+
+  assert.equal(promptCount, 0);
+  assert.equal(harness.callbackAnswers.length, 3);
+  assert.ok(harness.callbackAnswers.every((answer) => /not valid/.test(answer.text)));
+});
+
+test("expires a routine widget without sending a Grok prompt", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  const token = /^gtw:([^:]+):/.exec(data)[1];
+  harness.state.approvals.get(token).expiresAt = Date.now() - 1;
+  let promptCount = 0;
+  harness.grok.sendPrompt = async () => { promptCount += 1; };
+
+  await harness.bridge.handleCallbackQuery(widgetCallback(harness, data, { id: "expired" }));
+
+  assert.equal(promptCount, 0);
+  assert.equal(harness.state.getApproval(token), undefined);
+  assert.match(harness.callbackAnswers.at(-1).text, /expired/);
+  assert.deepEqual(harness.markupEdits.at(-1).inlineKeyboard, []);
+});
+
+test("does not resubmit after a crash before sendPrompt", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  await harness.state.setApproval(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    selectedValue: "Continue",
+    submissionIntent: true,
+    expiresAt: Date.now() + 60_000,
+  });
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+
+  await harness.bridge.handleCallbackQuery({
+    callback_query: {
+      id: "crash-before-send",
+      data: `gtw:${token}:0`,
+      from: { id: 42 },
+      message: { message_id: 55, chat: { id: 99, type: "private" } },
+    },
+  });
+
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.state.getApproval(token).submissionIntent, true);
+  assert.match(harness.callbackAnswers.at(-1).text, /will not be sent twice/);
+});
+
+test("reconciles a crash after accept before persist without resubmitting", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  await harness.state.setApproval(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    selectedValue: "Continue",
+    submissionIntent: true,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce,
+    message: { type: "text", content: "Continue" },
+  });
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Recovered without resubmitting",
+    attachments: [],
   });
 
   await harness.bridge.pollDesktopMirrorOnce();
 
-  assert.match(harness.sent[0].text, /Open Grok Bot/);
-  assert.equal(harness.sent[0].options.inlineKeyboard, undefined);
-  assert.equal(promptCount, 0);
-  assert.equal(harness.state.approvals.size, 0);
-  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-widget");
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.state.getApproval(token).submitted, true);
+  assert.equal(harness.sent.at(-1).text, "Recovered without resubmitting");
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, 55);
+  assert.equal(harness.state.getApproval(token).replyDelivered, true);
+});
+
+test("resumes only widget reply delivery after restart", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  await harness.state.setApproval(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    selectedValue: "Continue",
+    submissionIntent: true,
+    submitted: true,
+    accepted: true,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce,
+    message: { type: "text", content: "Continue" },
+  });
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Restarted reply",
+    attachments: [],
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.sent.at(-1).text, "Restarted reply");
+  assert.equal(harness.sent.at(-1).options.replyToMessageId, 55);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+});
+
+test("recovers a prior-agent widget after /use without resubmitting", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  await harness.state.setApproval(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    selectedValue: "Continue",
+    submissionIntent: true,
+    submitted: true,
+    accepted: true,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce,
+    message: { type: "text", content: "Continue" },
+  });
+  harness.transcripts.set("research", [
+    { id: "research-old", kind: "send-message", message: { type: "text", content: "Research history" } },
+  ]);
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Recovered after agent switch",
+    attachments: [],
+  });
+
+  await harness.bridge.handleUpdate(command("/use Research"));
+  assert.equal(harness.state.getAgent(99), "research");
+  assert.equal(harness.state.getMirrorCursor("research").entryId, "research-old");
+  harness.sent.length = 0;
+  harness.transcripts.get("research").push({
+    id: "research-new",
+    kind: "send-message",
+    message: { type: "text", content: "New research routine" },
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.state.getApproval(token).submitted, true);
+  assert.equal(harness.state.getApproval(token).accepted, true);
+  assert.equal(harness.state.getApproval(token).replyDelivered, true);
+  const recoveredAt = harness.sent.findIndex((message) => message.text === "Recovered after agent switch");
+  const researchAt = harness.sent.findIndex((message) => /New research routine/.test(message.text));
+  assert.ok(recoveredAt >= 0);
+  assert.ok(researchAt > recoveredAt);
+  assert.equal(harness.sent[recoveredAt].options.replyToMessageId, 55);
+  assert.equal(harness.sent.filter((message) => /Research history/.test(message.text)).length, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+  assert.equal(harness.state.getMirrorCursor("research").entryId, "research-new");
+});
+
+test("does not let a widget choice jump over intervening autonomous output", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  harness.grok.sendPrompt = async (_agentId, text, nonce) => {
+    harness.transcripts.get("chief").push(
+      { id: "intervening-routine", kind: "send-message", message: { type: "text", content: "Intervening routine" } },
+      { id: "widget-prompt", kind: "message", clientNonce: nonce, message: { type: "text", content: text } },
+    );
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Choice reply",
+    attachments: [],
+  });
+
+  await harness.bridge.handleCallbackQuery(widgetCallback(harness, data, { id: "choice" }));
+
+  const texts = harness.sent.map((message) => message.text);
+  const interveningAt = texts.findIndex((text) => /Intervening routine/.test(text));
+  const replyAt = texts.findIndex((text) => text === "Choice reply");
+  assert.ok(interveningAt >= 0);
+  assert.ok(replyAt > interveningAt);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+});
+
+test("serializes concurrent widget callbacks so a choice is submitted once", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(safeRoutineWidget());
+  await harness.bridge.pollDesktopMirrorOnce();
+  const data = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  let releaseSend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async (_agentId, text, nonce) => {
+    submissionCount += 1;
+    await sendGate;
+    harness.transcripts.get("chief").push({
+      id: `widget-prompt-${submissionCount}`,
+      kind: "message",
+      clientNonce: nonce,
+      message: { type: "text", content: text },
+    });
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "One reply",
+    attachments: [],
+  });
+
+  const first = harness.bridge.handleCallbackQuery(widgetCallback(harness, data, { id: "first" }));
+  const second = harness.bridge.handleCallbackQuery(widgetCallback(harness, data, { id: "second" }));
+  await Promise.resolve();
+  releaseSend();
+  await Promise.all([first, second]);
+
+  assert.equal(submissionCount, 1);
+  assert.equal(harness.sent.filter((message) => message.text === "One reply").length, 1);
 });
 
 test("skips a Telegram-originated prompt and its complete response turn", async () => {
