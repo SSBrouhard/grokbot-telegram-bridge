@@ -108,7 +108,7 @@ flowchart LR
 
 Approval buttons are bound to the initiating user, chat, Telegram message, Grok agent, transcript entry, and request ID. For a desktop-mirrored turn, the initiating identity is the configured mirror user and chat. The bridge rechecks that the Grok request is still pending before applying a decision. Approvals survive process restarts, expire after 10 minutes, and never map to Grok's persistent `always` or `never` values.
 
-Autonomous routine choice cards use a separate contract. They are delivered only to the configured mirror user and chat, are bound to their Telegram message and Grok transcript entry, and expire after 12 hours. A choice submits the card's exact value to the same Grok agent as a new prompt. The bridge removes the keyboard after submission and retries reply delivery after a bridge restart without submitting the choice again.
+Autonomous routine choice cards use a separate contract. They are one-time actions delivered only to the configured mirror user and chat, are bound to their Telegram message and Grok transcript entry, and expire after 12 hours. A choice submits the card's exact value to the same Grok agent as a new prompt. The bridge removes the keyboard after submission and retries reply delivery after a bridge restart without submitting the choice again.
 
 Treat Telegram account security as part of this boundary. Enable Telegram two-step verification and a device passcode. Do not send passwords, API keys, or other secrets through the bot.
 
@@ -117,9 +117,9 @@ Treat Telegram account security as part of this boundary. Enable Telegram two-st
 - Accepts text, photos, voice notes, audio, video, and file attachments from explicitly allowed private chats. Public Bot API downloads and uploads are capped at **20 MB**.
 - Sends each prompt to **Chief of Staff** by default, or to another agent selected with `/use`.
 - Returns the correlated reply, including Grok files and images when the gateway exposes them.
-- Optionally mirrors desktop-originated prompts and completed replies into one configured Telegram chat, threading each reply under its desktop prompt.
+- Optionally mirrors desktop-originated turns and autonomous scheduled-routine output into one configured Telegram chat, threading each desktop reply under its prompt.
 - Relays current auto-review and local-computer permission requests with only **Approve once** and **Deny**.
-- Persists Telegram offsets, per-chat agent selection, desktop-mirror cursors and override, and pending approvals so a restart does not lose that state.
+- Persists Telegram offsets, per-chat agent selection, desktop-mirror cursors and override, pending interactions, and multipart delivery progress so a restart does not lose that state.
 
 Voice notes are forwarded with an explicit transcription instruction. Replies use safe Telegram HTML when conversion succeeds, otherwise plain text. The bridge sends typing actions and success or error reactions. It does not stream partial responses and does not support Telegram topics, groups, channels, or webhooks.
 
@@ -156,7 +156,7 @@ To enable mirroring, set both `GROK_DESKTOP_MIRROR_CHAT_ID` and `GROK_DESKTOP_MI
 
 On its first watch of an agent, the bridge records that agent's newest transcript entry and sends no history. It watches the agent selected with `/use` for the configured mirror chat, falling back to `GROK_DEFAULT_AGENT`. Selecting an agent never watched before baselines it before switching; switching back resumes its durable cursor. Prompts created by this bridge have a `telegram:` client nonce, so their entire turns are excluded from desktop mirroring to prevent duplicate replies and feedback loops.
 
-Desktop prompt text, completed Markdown replies, images, and files are mirrored when the local gateway transcript exposes readable data. If attachment metadata is visible but no readable gateway path is available, Telegram receives an explicit unavailable-attachment notice. Partial progress is not used as the final response. The mirror watcher retries independently with bounded backoff, so a slow or temporarily unavailable desktop turn does not stop Telegram polling, commands, callbacks, or other chats.
+Desktop prompt text, completed Markdown replies, images, and files are mirrored when the local gateway transcript exposes readable data. Completed autonomous routine output is also mirrored when no desktop prompt precedes it. If attachment metadata is visible but no readable gateway path is available, Telegram receives an explicit unavailable-attachment notice. Partial progress is not used as the final response. The mirror watcher retries independently with bounded backoff, so a slow or temporarily unavailable desktop turn or routine does not stop Telegram polling, commands, callbacks, or other chats.
 
 ## Operations
 
@@ -209,7 +209,7 @@ Logs are `bridge.log` next to the process. They include operational errors and o
 | Desktop-only UI | Chat Settings, General Settings, and Usage & Billing stay in the Grok desktop UI. |
 | Plugin mentions | Account-plugin `@` mentions cannot be built from the current gateway. |
 | Telegram delivery | A crash can redeliver an update. A reply can also repeat if Telegram accepted it just before the process died. |
-| Desktop mirroring | Also at-least-once: its per-agent cursor advances only after the prompt, final response, and attachments are accepted by Telegram. A crash immediately after acceptance can therefore duplicate that turn. |
+| Desktop mirroring | Also at-least-once: desktop-turn cursors advance after the full turn is accepted, while autonomous output records multipart delivery progress. A crash after Telegram accepts a turn or part but before state is saved can still duplicate it. |
 | Gateway transcript | The shape is unofficial. Optional desktop prompt text and attachment fields are read only when present; otherwise the bridge sends an explicit unavailable-content notice. |
 
 ## License
