@@ -115,7 +115,7 @@ Treat Telegram account security as part of this boundary. Enable Telegram two-st
 - Accepts text, photos, voice notes, audio, video, and file attachments from explicitly allowed private chats. Public Bot API downloads and uploads are capped at **20 MB**.
 - Sends each prompt to **Chief of Staff** by default, or to another agent selected with `/use`.
 - Returns the correlated reply, including Grok files and images when the gateway exposes them.
-- Optionally mirrors desktop-originated prompts and completed replies into one configured Telegram chat, threading each reply under its desktop prompt.
+- Optionally mirrors desktop-originated prompts, completed replies, and autonomous scheduled-routine output into one configured Telegram chat, threading each desktop reply under its prompt.
 - Relays current auto-review and local-computer permission requests with only **Approve once** and **Deny**.
 - Persists Telegram offsets, per-chat agent selection, desktop-mirror cursors and override, and pending approvals so a restart does not lose that state.
 
@@ -152,9 +152,9 @@ To enable mirroring, set both `GROK_DESKTOP_MIRROR_CHAT_ID` and `GROK_DESKTOP_MI
 - Startup fails if the pair is incomplete or outside either allowlist. Omitting both disables the watcher.
 - `/mirror status`, `/mirror on`, and `/mirror off` inspect or persistently control the watcher from the configured identity only.
 
-On its first watch of an agent, the bridge records that agent's newest transcript entry and sends no history. It watches the agent selected with `/use` for the configured mirror chat, falling back to `GROK_DEFAULT_AGENT`. Selecting an agent never watched before baselines it before switching; switching back resumes its durable cursor. Prompts created by this bridge have a `telegram:` client nonce, so their entire turns are excluded from desktop mirroring to prevent duplicate replies and feedback loops.
+On its first watch of an agent, the bridge records that agent's newest transcript entry and sends no history. If the agent is still working, that first snapshot is held until it goes idle so output created after startup is not discarded with pre-start history. An empty first fetch does not persist a start-from-beginning cursor. It watches the agent selected with `/use` for the configured mirror chat, falling back to `GROK_DEFAULT_AGENT`. Selecting an agent never watched before baselines it before switching; switching back resumes its durable cursor. Prompts created by this bridge have a `telegram:` client nonce, so their entire turns are excluded from desktop mirroring to prevent duplicate replies and feedback loops.
 
-Desktop prompt text, completed Markdown replies, images, and files are mirrored when the local gateway transcript exposes readable data. If attachment metadata is visible but no readable gateway path is available, Telegram receives an explicit unavailable-attachment notice. Partial progress is not used as the final response. The mirror watcher retries independently with bounded backoff, so a slow or temporarily unavailable desktop turn does not stop Telegram polling, commands, callbacks, or other chats.
+Desktop prompt text, completed Markdown replies, images, and files are mirrored when the local gateway transcript exposes readable data. Completed autonomous routine text and files are also mirrored when no desktop or Telegram prompt precedes them. Routine choice cards and other rich widgets are not interactive in Telegram; they receive the existing Open Grok Bot handoff. If attachment metadata is visible but no readable gateway path is available, Telegram receives an explicit unavailable-attachment notice. Partial progress is not used as the final response. The mirror watcher retries independently with bounded backoff, so a slow or temporarily unavailable desktop turn or routine does not stop Telegram polling, commands, callbacks, or other chats.
 
 ## Operations
 

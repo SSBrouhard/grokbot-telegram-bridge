@@ -69,6 +69,10 @@ function formatApproval(details) {
   return lines.join("\n");
 }
 
+function newestTranscriptEntryId(entries) {
+  return [...entries].reverse().find((entry) => typeof entry?.id === "string" && entry.id)?.id;
+}
+
 function messageAttachments(message) {
   const attachments = [];
   const largestPhoto = message.photo?.at(-1);
@@ -159,6 +163,7 @@ export class Bridge {
       mirrorChatId,
       mirrorUserId,
     });
+    this.firstWatchSnapshots = new Map();
   }
 
   isAuthorized(message) {
@@ -204,10 +209,33 @@ export class Bridge {
     }
   }
 
+  async mirrorAgentBusy(agentId, options = {}) {
+    if (options.agent?.isRunning === true || options.agent?.isComposingMessage === true) return true;
+    return typeof this.grok.isAgentBusy === "function"
+      ? this.grok.isAgentBusy(agentId, options)
+      : false;
+  }
+
   async ensureMirrorBaseline(agentId, options = {}) {
     if (!options.force && this.state.getMirrorCursor(agentId)) return false;
-    const entries = await this.getTranscriptEntries(agentId, options);
-    const newestId = [...entries].reverse().find((entry) => typeof entry?.id === "string" && entry.id)?.id;
+    let entries = await this.getTranscriptEntries(agentId, options);
+    if (!entries.length && !options.force) {
+      entries = await this.grok.getTranscript(agentId, options);
+    }
+    const newestId = newestTranscriptEntryId(entries);
+    if (!options.force && !entries.length) return true;
+    if (!options.force && await this.mirrorAgentBusy(agentId, options)) {
+      if (!this.firstWatchSnapshots.has(agentId)) {
+        this.firstWatchSnapshots.set(agentId, newestId ?? null);
+      }
+      return true;
+    }
+    const snapshot = this.firstWatchSnapshots.get(agentId);
+    this.firstWatchSnapshots.delete(agentId);
+    if (snapshot !== undefined) {
+      await this.state.setMirrorCursor(agentId, snapshot);
+      return false;
+    }
     await this.state.setMirrorCursor(agentId, newestId);
     return true;
   }
@@ -466,7 +494,8 @@ export class Bridge {
     const agents = await this.grok.listAgents(options);
     const agent = this.resolveAgent(this.mirrorChatId, agents);
     if (!agent) throw new Error("Desktop mirror agent is unavailable");
-    if (await this.ensureMirrorBaseline(agent.id, options)) return;
+    const baselineOptions = { ...options, agent };
+    if (await this.ensureMirrorBaseline(agent.id, baselineOptions)) return;
 
     let entries = await this.getTranscriptEntries(agent.id, options);
     const cursor = this.state.getMirrorCursor(agent.id);
@@ -477,7 +506,7 @@ export class Bridge {
       entries = await this.grok.getTranscript(agent.id, options);
       cursorIndex = entries.findIndex((entry) => entry?.id === cursor.entryId);
       if (cursorIndex < 0) {
-        await this.ensureMirrorBaseline(agent.id, { ...options, force: true });
+        await this.ensureMirrorBaseline(agent.id, { ...baselineOptions, force: true });
         return;
       }
     }
@@ -485,8 +514,47 @@ export class Bridge {
     if (!unseen.length) return;
     const promptIndex = unseen.findIndex((entry) => isTopLevelPromptEntry(entry)
       && typeof entry?.id === "string" && entry.id);
+    const autonomousIndex = unseen.findIndex((entry) => entry?.kind === "send-message");
+    if (autonomousIndex >= 0 && (promptIndex < 0 || autonomousIndex < promptIndex)) {
+      if (await this.mirrorAgentBusy(agent.id, baselineOptions)) return;
+      const turnEnd = promptIndex < 0 ? unseen.length : promptIndex;
+      await this.mirrorAutonomousOutput(
+        agent,
+        unseen.slice(autonomousIndex, turnEnd).filter((entry) => entry?.kind === "send-message"),
+        options,
+      );
+      return;
+    }
     if (promptIndex < 0) return;
     await this.mirrorDesktopTurn(agent, unseen[promptIndex], options);
+  }
+
+  async mirrorAutonomousOutput(agent, entries, options = {}) {
+    if (!entries.length) return;
+    for (const entry of entries) {
+      if (typeof entry?.id !== "string" || !entry.id) {
+        throw new Error("Grok returned no transcript cursor for autonomous output");
+      }
+      const reply = this.grok.getReplyContent([entry]);
+      const text = reply.text
+        ? `⏰ Routine · ${agent.name}\n\n${reply.text}`
+        : !(reply.attachments ?? []).length
+          ? "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it."
+          : undefined;
+      let rootMessageId;
+      if (text) {
+        const sent = await this.telegram.sendMessage(this.mirrorChatId, text, options);
+        rootMessageId = sent?.message_id;
+      }
+      const replyOptions = Number.isSafeInteger(rootMessageId)
+        ? { ...options, replyToMessageId: rootMessageId }
+        : options;
+      for (const attachment of reply.attachments ?? []) {
+        const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
+        await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
+      }
+      await this.state.setMirrorCursor(agent.id, entry.id);
+    }
   }
 
   async mirrorDesktopTurn(agent, promptEntry, options = {}) {
