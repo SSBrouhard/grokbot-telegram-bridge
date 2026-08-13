@@ -121,6 +121,74 @@ test("skips a Telegram-originated prompt and its complete response turn", async 
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "telegram-final");
 });
 
+test("ignores internal multi-agent messages before the next desktop prompt", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    {
+      id: "dispatch",
+      kind: "message",
+      role: "assistant",
+      toAgent: "research",
+      content: "Internal delegation",
+    },
+    {
+      id: "child-reply",
+      kind: "message",
+      role: "user",
+      fromAgent: "research",
+      content: "Internal result",
+    },
+    {
+      id: "desktop-prompt",
+      kind: "message",
+      role: "user",
+      clientNonce: "desktop:after-agents",
+      content: "Real desktop prompt",
+    },
+    {
+      id: "nested-dispatch",
+      kind: "message",
+      role: "assistant",
+      toAgent: "research",
+      content: "Nested internal task",
+    },
+    {
+      id: "nested-result",
+      kind: "message",
+      role: "user",
+      fromAgent: "research",
+      content: "Nested internal result",
+    },
+    {
+      id: "desktop-final",
+      kind: "send-message",
+      message: { type: "text", content: "Consolidated desktop answer" },
+    },
+  );
+  const realGrok = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+  });
+  let agentChecks = 0;
+  realGrok.listAgents = async () => {
+    agentChecks += 1;
+    return harness.agents.map((agent) => ({
+      ...agent,
+      isRunning: agent.id === "chief" && agentChecks === 2,
+    }));
+  };
+  realGrok.getTranscriptTail = harness.grok.getTranscriptTail;
+  realGrok.getTranscript = harness.grok.getTranscript;
+  harness.bridge.grok = realGrok;
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /Real desktop prompt/);
+  assert.doesNotMatch(harness.sent[0].text, /Internal/);
+  assert.equal(harness.sent[1].text, "Consolidated desktop answer");
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "desktop-final");
+});
+
 test("baselines the newest transcript entry on first startup without replaying history", async () => {
   const transcripts = new Map([["chief", [
     { id: "historical-prompt", kind: "message", message: { type: "text", content: "Old prompt" } },

@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { GrokClient } from "../src/grok-client.js";
+import { GrokClient, isTopLevelPromptEntry } from "../src/grok-client.js";
+
+test("classifies only top-level user prompts as turn boundaries", () => {
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "user" }), true);
+  assert.equal(isTopLevelPromptEntry({ kind: "message" }), true);
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "assistant" }), false);
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "user", toAgent: "research" }), false);
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "user", fromAgent: "research" }), false);
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "user", toAgent: null, fromAgent: null }), true);
+  assert.equal(isTopLevelPromptEntry({ kind: "message", role: "user", toAgent: "", fromAgent: "" }), true);
+  assert.equal(isTopLevelPromptEntry({ kind: "send-message", role: "user" }), false);
+});
 
 test("uses Grok's command envelope", async () => {
   const requests = [];
@@ -192,6 +203,35 @@ test("correlates a reply to the exact client nonce", async () => {
   assert.deepEqual(await client.waitForReply("a1", "wanted"), {
     messageId: "reply",
     text: "Yours",
+    attachments: [],
+  });
+});
+
+test("keeps internal multi-agent messages inside their parent turn", async () => {
+  let statusCalls = 0;
+  const entries = [
+    { id: "prompt", kind: "message", role: "user", clientNonce: "wanted" },
+    { id: "progress", kind: "send-message", message: { type: "text", content: "Delegating..." } },
+    { id: "dispatch", kind: "message", role: "assistant", toAgent: "research", content: "Internal task" },
+    { id: "child-reply", kind: "message", role: "user", fromAgent: "research", content: "Internal result" },
+    { id: "final", kind: "send-message", message: { type: "text", content: "Consolidated answer" } },
+    { id: "next-prompt", kind: "message", role: "user", clientNonce: "next" },
+    { id: "next-reply", kind: "send-message", message: { type: "text", content: "Not part of this turn" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => url.endsWith("/listAgents")
+        ? ({ agents: [{ id: "a1", isRunning: ++statusCalls === 1 }] })
+        : ({ entries }),
+    }),
+  });
+
+  assert.deepEqual(await client.waitForReply("a1", "wanted"), {
+    messageId: "final",
+    text: "Consolidated answer",
     attachments: [],
   });
 });

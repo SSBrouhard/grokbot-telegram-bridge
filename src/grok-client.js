@@ -9,6 +9,13 @@ function unwrap(payload) {
   return payload?.result ?? payload;
 }
 
+export function isTopLevelPromptEntry(entry) {
+  return entry?.kind === "message"
+    && entry.role !== "assistant"
+    && !entry.toAgent
+    && !entry.fromAgent;
+}
+
 export class GrokClient {
   constructor(baseUrl, token, options = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
@@ -302,7 +309,7 @@ export class GrokClient {
           if (!/HTTP 404$/.test(error.message)) throw error;
           entries = await this.getTranscript(agentId, options);
         }
-        const matchesPrompt = (entry) => entry?.kind === "message"
+        const matchesPrompt = (entry) => isTopLevelPromptEntry(entry)
           && ((typeof clientNonce === "string" && entry?.clientNonce === clientNonce)
             || (typeof options.promptEntryId === "string" && entry?.id === options.promptEntryId));
         let promptIndex = entries.findIndex(matchesPrompt);
@@ -313,7 +320,7 @@ export class GrokClient {
         if (promptIndex >= 0) {
           promptObserved = true;
           const nextPromptOffset = entries.slice(promptIndex + 1)
-            .findIndex((entry) => entry?.kind === "message");
+            .findIndex(isTopLevelPromptEntry);
           const turnEnd = nextPromptOffset < 0 ? entries.length : promptIndex + 1 + nextPromptOffset;
           const replyEntries = entries.slice(promptIndex + 1, turnEnd)
             .filter((entry) => entry?.kind === "send-message");
