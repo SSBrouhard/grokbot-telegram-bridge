@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
+import { isTopLevelPromptEntry } from "./grok-client.js";
 import { buildRichText, findStructuredReferences } from "./grok-rich-text.js";
 
 const HELP = [
@@ -482,7 +483,7 @@ export class Bridge {
     }
     const unseen = entries.slice(cursorIndex + 1);
     if (!unseen.length) return;
-    const promptIndex = unseen.findIndex((entry) => entry?.kind === "message"
+    const promptIndex = unseen.findIndex((entry) => isTopLevelPromptEntry(entry)
       && typeof entry?.id === "string" && entry.id);
     if (promptIndex < 0) return;
     await this.mirrorDesktopTurn(agent, unseen[promptIndex], options);
