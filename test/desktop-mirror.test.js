@@ -7,6 +7,8 @@ import { GrokClient } from "../src/grok-client.js";
 function mirrorHarness(options = {}) {
   const sent = [];
   const attachments = [];
+  const callbackAnswers = [];
+  const markupEdits = [];
   const agents = [
     { id: "chief", name: "Chief of Staff", isRunning: false },
     { id: "research", name: "Research", isRunning: false },
@@ -42,15 +44,19 @@ function mirrorHarness(options = {}) {
       attachments.push({ chatId, attachment, options: sendOptions });
       return { message_id: 100 + attachments.length };
     },
-    async answerCallbackQuery() {},
-    async editMessageReplyMarkup() {},
+    async answerCallbackQuery(callbackId, text) { callbackAnswers.push({ callbackId, text }); },
+    async editMessageReplyMarkup(chatId, messageId, inlineKeyboard) {
+      markupEdits.push({ chatId, messageId, inlineKeyboard });
+    },
   };
   const grok = {
     pollIntervalMs: 1,
     async listAgents() { return agents; },
     async getTranscriptTail(agentId) { return transcripts.get(agentId) ?? []; },
     async getTranscript(agentId) { return transcripts.get(agentId) ?? []; },
+    async isAgentBusy() { return false; },
     getPromptContent: GrokClient.prototype.getPromptContent,
+    getReplyContent: GrokClient.prototype.getReplyContent,
     async waitForReply() { return { messageId: "final", text: "Finished.", attachments: [] }; },
     async readAttachment() { return new Uint8Array([1, 2, 3]); },
   };
@@ -64,7 +70,18 @@ function mirrorHarness(options = {}) {
     mirrorChatId: options.configured === false ? undefined : 99,
     mirrorUserId: options.configured === false ? undefined : 42,
   });
-  return { bridge, telegram, grok, state, sent, attachments, agents, transcripts };
+  return {
+    bridge,
+    telegram,
+    grok,
+    state,
+    sent,
+    attachments,
+    agents,
+    transcripts,
+    callbackAnswers,
+    markupEdits,
+  };
 }
 
 const command = (text, userId = 42, chatId = 99) => ({
@@ -98,6 +115,109 @@ test("mirrors a desktop prompt and completed Markdown response in one Telegram r
   assert.equal(harness.sent[1].text, "## Finished\n\n- result");
   assert.equal(harness.sent[1].options.replyToMessageId, harness.sent[0].message_id);
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "final");
+});
+
+test("mirrors autonomous routine text without a preceding user prompt", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "routine-text",
+    kind: "send-message",
+    message: { type: "text", content: "Morning revenue proposal" },
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /Routine · Chief of Staff/);
+  assert.match(harness.sent[0].text, /Morning revenue proposal/);
+  assert.equal(harness.sent[0].options.inlineKeyboard, undefined);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-text");
+});
+
+test("checkpoints each autonomous entry so a failed later send does not duplicate prior text", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-one", kind: "send-message", message: { type: "text", content: "First update" } },
+    { id: "routine-two", kind: "send-message", message: { type: "text", content: "Second update" } },
+  );
+  const originalSend = harness.telegram.sendMessage;
+  let failSecond = true;
+  harness.telegram.sendMessage = async (chatId, text, options) => {
+    if (/Second update/.test(text) && failSecond) {
+      failSecond = false;
+      throw new Error("Telegram unavailable");
+    }
+    return originalSend(chatId, text, options);
+  };
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /Telegram unavailable/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-one");
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.filter((message) => /First update/.test(message.text)).length, 1);
+  assert.equal(harness.sent.filter((message) => /Second update/.test(message.text)).length, 1);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-two");
+});
+
+test("delivers every backlogged autonomous text entry in transcript order", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-one", kind: "send-message", message: { type: "text", content: "First routine" } },
+    { id: "routine-two", kind: "send-message", message: { type: "text", content: "Second routine" } },
+  );
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /First routine/);
+  assert.match(harness.sent[1].text, /Second routine/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-two");
+});
+
+test("refuses to rewind the mirror cursor when autonomous output has no entry id", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { id: "routine-one", kind: "send-message", message: { type: "text", content: "First routine" } },
+    { kind: "send-message", message: { type: "text", content: "Missing id" } },
+  );
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /no transcript cursor/);
+
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-one");
+});
+
+test("does not skip an unidentified autonomous entry before an identified one", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push(
+    { kind: "send-message", message: { type: "text", content: "Missing id first" } },
+    { id: "routine-two", kind: "send-message", message: { type: "text", content: "Second routine" } },
+  );
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /no transcript cursor/);
+
+  assert.equal(harness.sent.length, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "old");
+});
+
+test("sends the Open Grok Bot handoff for autonomous widgets without offering a choice", async () => {
+  const harness = mirrorHarness();
+  let promptCount = 0;
+  harness.grok.sendPrompt = async () => { promptCount += 1; };
+  harness.transcripts.get("chief").push({
+    id: "routine-widget",
+    kind: "send-message",
+    message: { type: "widget", widget: {
+      prompt: "Approve today's must-win?",
+      options: [{ label: "Draft follow-up", value: "Approve RF-1 draft follow-up" }],
+    } },
+  });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.match(harness.sent[0].text, /Open Grok Bot/);
+  assert.equal(harness.sent[0].options.inlineKeyboard, undefined);
+  assert.equal(promptCount, 0);
+  assert.equal(harness.state.approvals.size, 0);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-widget");
 });
 
 test("skips a Telegram-originated prompt and its complete response turn", async () => {
@@ -200,6 +320,53 @@ test("baselines the newest transcript entry on first startup without replaying h
 
   assert.deepEqual(harness.sent, []);
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "historical-final");
+});
+
+test("does not persist a start-from-beginning cursor when the first watch is empty", async () => {
+  const transcripts = new Map([["chief", []]]);
+  const harness = mirrorHarness({ transcripts, cursors: [] });
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.state.getMirrorCursor("chief"), undefined);
+  assert.deepEqual(harness.sent, []);
+
+  harness.transcripts.get("chief").push(
+    { id: "historical-prompt", kind: "message", message: { type: "text", content: "Old prompt" } },
+    { id: "historical-final", kind: "send-message", message: { type: "text", content: "Old answer" } },
+  );
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.deepEqual(harness.sent, []);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "historical-final");
+});
+
+test("delivers autonomous output created after startup while the first watch waits for idle", async () => {
+  const transcripts = new Map([["chief", [
+    { id: "historical-prompt", kind: "message", message: { type: "text", content: "Old prompt" } },
+    { id: "historical-final", kind: "send-message", message: { type: "text", content: "Old answer" } },
+  ]]]);
+  const harness = mirrorHarness({ transcripts, cursors: [] });
+  harness.agents[0].isRunning = true;
+  harness.grok.isAgentBusy = async () => harness.agents[0].isRunning === true;
+
+  await harness.bridge.pollDesktopMirrorOnce();
+  assert.deepEqual(harness.sent, []);
+  assert.equal(harness.state.getMirrorCursor("chief"), undefined);
+
+  harness.transcripts.get("chief").push({
+    id: "post-start-routine",
+    kind: "send-message",
+    message: { type: "text", content: "Morning brief after wake" },
+  });
+  harness.agents[0].isRunning = false;
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.length, 1);
+  assert.match(harness.sent[0].text, /Morning brief after wake/);
+  assert.doesNotMatch(harness.sent[0].text, /Old answer/);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "post-start-routine");
 });
 
 test("does not advance a desktop cursor when final Telegram delivery fails", async () => {
