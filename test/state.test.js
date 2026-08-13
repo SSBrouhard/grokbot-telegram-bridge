@@ -76,6 +76,33 @@ test("persists prompt delivery context and consumes a completed turn boundary", 
   assert.equal(reloaded.getPromptTurnBoundary("chief", "telegram:10:99:70"), undefined);
 });
 
+test("prunes unused expired routine widgets but keeps a submission intent", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-widget-"));
+  const filename = path.join(directory, "state.json");
+  const store = new JsonStateStore(filename);
+  await store.load();
+  await store.setApproval("abcdefghijklmnopqrstuvwx", {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    submissionIntent: true,
+    clientNonce: "telegram:widget:abcdefghijklmnopqrstuvwx:0",
+    expiresAt: Date.now() - 1,
+  });
+  await store.setApproval("yzabcdefghijklmnopqrstuv", {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "other-widget",
+    expiresAt: Date.now() - 1,
+  });
+
+  const reloaded = new JsonStateStore(filename);
+  await reloaded.load();
+  assert.equal(reloaded.getApproval("abcdefghijklmnopqrstuvwx").submissionIntent, true);
+  assert.equal(reloaded.getApproval("yzabcdefghijklmnopqrstuv"), undefined);
+  assert.equal(reloaded.listApprovals().length, 1);
+});
+
 test("quarantines malformed state and starts cleanly", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-"));
   const filename = path.join(directory, "state.json");

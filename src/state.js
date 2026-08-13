@@ -203,6 +203,10 @@ export class JsonStateStore {
     return this.pendingApprovals[token];
   }
 
+  listApprovals() {
+    return Object.entries(this.pendingApprovals);
+  }
+
   async setApproval(token, approval) {
     this.#pruneExpiredApprovals();
     this.pendingApprovals[token] = approval;
@@ -231,6 +235,7 @@ export class JsonStateStore {
   #pruneExpiredApprovals(now = Date.now()) {
     let changed = false;
     for (const [token, approval] of Object.entries(this.pendingApprovals)) {
+      if (approval?.type === "routine-widget" && approval.submissionIntent === true) continue;
       if (Number.isFinite(approval?.expiresAt) && approval.expiresAt <= now) {
         delete this.pendingApprovals[token];
         changed = true;
