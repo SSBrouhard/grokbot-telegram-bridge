@@ -1,0 +1,25 @@
+{
+  "name": "grokbot-telegram-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Unofficial self-hosted Telegram bridge for Grok Bot's local Sand gateway.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ssbrouhard/grokbot-telegram-bridge.git"
+  },
+  "homepage": "https://github.com/ssbrouhard/grokbot-telegram-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/ssbrouhard/grokbot-telegram-bridge/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/main.js",
+    "discover-ids": "node --env-file=.env src/discover-telegram-identity.js",
+    "test": "node --test",
+    "check": "node --check src/*.js"
+  }
+}

@@ -1,0 +1,30 @@
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Runtime state, locks, and logs
+bridge-state.json
+bridge-state.json.*
+bridge-state.json.corrupt-*
+*.corrupt-*
+bridge.pid
+.control-lock/
+*.log
+*.tmp
+
+# Accidental copies of Grok gateway discovery records
+gateway.json
+**/gateway.json
+
+# Local tooling
+node_modules/
+coverage/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local release notes that may mention unpublished remotes
+RELEASE_AUDIT.md
