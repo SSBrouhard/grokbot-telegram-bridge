@@ -531,29 +531,23 @@ export class Bridge {
         });
       } else {
         const reply = this.grok.getReplyContent([entry]);
-        let rootMessageId;
-        if (reply.text) {
-          const sent = await this.telegram.sendMessage(
-            this.mirrorChatId,
-            `⏰ Routine · ${agent.name}\n\n${reply.text}`,
-            options,
-          );
-          rootMessageId = sent?.message_id;
-        }
-        const replyOptions = Number.isSafeInteger(rootMessageId)
-          ? { ...options, replyToMessageId: rootMessageId }
-          : options;
-        for (const attachment of reply.attachments ?? []) {
-          const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
-          await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
-        }
-        if (!reply.text && !(reply.attachments ?? []).length) {
-          await this.telegram.sendMessage(
-            this.mirrorChatId,
-            "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it.",
-            options,
-          );
-        }
+        const text = reply.text
+          ? `⏰ Routine · ${agent.name}\n\n${reply.text}`
+          : !(reply.attachments ?? []).length
+            ? "Grok produced autonomous output that Telegram cannot render. Open Grok Bot to view it."
+            : undefined;
+        const deliveryKey = `autonomous:${agent.id}:${entry.id}`;
+        await this.deliverTelegramParts({
+          deliveryKey,
+          chatId: this.mirrorChatId,
+          agentId: agent.id,
+          text,
+          attachments: reply.attachments,
+          options,
+        });
+        await this.state.setMirrorCursor(agent.id, entry.id);
+        await this.state.deleteDeliveryProgress(deliveryKey);
+        continue;
       }
       await this.state.setMirrorCursor(agent.id, entry.id);
     }
@@ -565,17 +559,22 @@ export class Bridge {
     const widgetToken = /^telegram:widget:([A-Za-z0-9_-]{24}):[0-9a-z]$/.exec(clientNonce ?? "")?.[1];
     if (widgetToken) {
       const widget = this.state.getApproval(widgetToken);
-      if (widget?.type === "routine-widget") {
-        if (!widget.submitted || widget.resolving) return;
+      if (widget?.type === "routine-widget"
+        && widget.agentId === agent.id
+        && widget.clientNonce === clientNonce) {
+        if (!widget.submissionIntent || widget.resolving) return;
+        widget.submitted = true;
         widget.resolving = true;
         await this.state.setApproval(widgetToken, widget);
         try {
           const reply = await this.grok.waitForReply(agent.id, clientNonce, waitOptions);
-          await this.deliverRoutineWidgetReply(widget, reply, options);
+          const deliveryKey = this.routineWidgetDeliveryKey(widget);
+          await this.deliverRoutineWidgetReply(widget, reply, deliveryKey, options);
           if (typeof reply?.messageId === "string" && reply.messageId) {
             await this.state.setMirrorCursor(agent.id, reply.messageId);
           }
           await this.state.deleteApproval(widgetToken);
+          await this.state.deleteDeliveryProgress(deliveryKey);
         } catch (error) {
           widget.resolving = false;
           await this.state.setApproval(widgetToken, widget);
@@ -852,18 +851,33 @@ export class Bridge {
     await this.state.setApproval(token, widget);
     try {
       const clientNonce = `telegram:widget:${token}:${choiceIndex.toString(36)}`;
-      await this.grok.sendPrompt(widget.agentId, choice.value, clientNonce, options);
-      widget.submitted = true;
-      widget.clientNonce = clientNonce;
-      await this.state.setApproval(token, widget);
+      if (widget.submissionIntent) {
+        if (widget.choiceIndex !== choiceIndex || widget.clientNonce !== clientNonce) {
+          widget.resolving = false;
+          await this.state.setApproval(token, widget);
+          await this.telegram.answerCallbackQuery(callback.id, "That widget choice was already used.", options);
+          return;
+        }
+        const submittedEntry = await this.findTranscriptEntryByNonce(widget.agentId, clientNonce, options);
+        if (submittedEntry) widget.submitted = true;
+      } else {
+        widget.submissionIntent = true;
+        widget.clientNonce = clientNonce;
+        widget.choiceIndex = choiceIndex;
+        await this.state.setApproval(token, widget);
+      }
+      if (!widget.submitted) {
+        await this.grok.sendPrompt(widget.agentId, choice.value, clientNonce, options);
+        widget.submitted = true;
+        await this.state.setApproval(token, widget);
+      }
       await this.telegram.editMessageReplyMarkup(widget.chatId, widget.messageId, [], options).catch(() => {});
       await this.telegram.answerCallbackQuery(callback.id, "Sent to Grok.", options).catch(() => {});
       const reply = await this.grok.waitForReply(widget.agentId, clientNonce, options);
-      await this.deliverRoutineWidgetReply(widget, reply, options);
-      if (typeof reply.messageId === "string" && reply.messageId) {
-        await this.state.setMirrorCursor(widget.agentId, reply.messageId);
-      }
+      const deliveryKey = this.routineWidgetDeliveryKey(widget);
+      await this.deliverRoutineWidgetReply(widget, reply, deliveryKey, options);
       await this.state.deleteApproval(token);
+      await this.state.deleteDeliveryProgress(deliveryKey);
     } catch (error) {
       if (this.state.getApproval(token)) {
         widget.resolving = false;
@@ -873,15 +887,54 @@ export class Bridge {
     }
   }
 
-  async deliverRoutineWidgetReply(widget, reply, options = {}) {
-    const replyOptions = { ...options, replyToMessageId: widget.messageId };
-    if (reply.text) await this.telegram.sendMessage(widget.chatId, reply.text, replyOptions);
-    for (const attachment of reply.attachments ?? []) {
-      const bytes = await this.grok.readAttachment(widget.agentId, attachment.path, options);
-      await this.telegram.sendAttachment(widget.chatId, { ...attachment, bytes }, replyOptions);
-    }
-    if (!reply.text && !(reply.attachments ?? []).length) {
-      await this.telegram.sendMessage(widget.chatId, "Grok completed without a Telegram-renderable response.", replyOptions);
+  async findTranscriptEntryByNonce(agentId, clientNonce, options = {}) {
+    let entries = await this.getTranscriptEntries(agentId, options);
+    let entry = entries.find((candidate) => candidate?.clientNonce === clientNonce);
+    if (entry) return entry;
+    entries = await this.grok.getTranscript(agentId, options);
+    return entries.find((candidate) => candidate?.clientNonce === clientNonce);
+  }
+
+  routineWidgetDeliveryKey(widget) {
+    return `widget:${widget.agentId}:${widget.clientNonce}`;
+  }
+
+  async deliverRoutineWidgetReply(widget, reply, deliveryKey, options = {}) {
+    const text = reply.text || (!(reply.attachments ?? []).length
+      ? "Grok completed without a Telegram-renderable response."
+      : undefined);
+    await this.deliverTelegramParts({
+      deliveryKey,
+      chatId: widget.chatId,
+      agentId: widget.agentId,
+      text,
+      attachments: reply.attachments,
+      options: { ...options, replyToMessageId: widget.messageId },
+    });
+  }
+
+  async deliverTelegramParts({ deliveryKey, chatId, agentId, text, attachments = [], options = {} }) {
+    const parts = [
+      ...(text ? [{ type: "text", text }] : []),
+      ...attachments.map((attachment) => ({ type: "attachment", attachment })),
+    ];
+    const progress = this.state.getDeliveryProgress(deliveryKey) ?? { nextPart: 0 };
+    for (let index = progress.nextPart; index < parts.length; index += 1) {
+      const part = parts[index];
+      if (part.type === "text") {
+        const sent = await this.telegram.sendMessage(chatId, part.text, options);
+        if (!options.replyToMessageId && Number.isSafeInteger(sent?.message_id)) {
+          progress.rootMessageId = sent.message_id;
+        }
+      } else {
+        const bytes = await this.grok.readAttachment(agentId, part.attachment.path, options);
+        const attachmentOptions = Number.isSafeInteger(progress.rootMessageId)
+          ? { ...options, replyToMessageId: progress.rootMessageId }
+          : options;
+        await this.telegram.sendAttachment(chatId, { ...part.attachment, bytes }, attachmentOptions);
+      }
+      progress.nextPart = index + 1;
+      await this.state.setDeliveryProgress(deliveryKey, progress);
     }
   }
 

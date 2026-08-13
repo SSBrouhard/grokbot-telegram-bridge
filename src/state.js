@@ -10,6 +10,7 @@ export class JsonStateStore {
     this.pendingApprovals = {};
     this.mirrorEnabled = undefined;
     this.mirrorCursors = {};
+    this.pendingDeliveries = {};
     this.saveQueue = Promise.resolve();
   }
 
@@ -39,6 +40,9 @@ export class JsonStateStore {
       this.mirrorEnabled = typeof parsed.mirrorEnabled === "boolean" ? parsed.mirrorEnabled : undefined;
       this.mirrorCursors = parsed.mirrorCursors && typeof parsed.mirrorCursors === "object"
         ? parsed.mirrorCursors
+        : {};
+      this.pendingDeliveries = parsed.pendingDeliveries && typeof parsed.pendingDeliveries === "object"
+        ? parsed.pendingDeliveries
         : {};
       if (this.#prepareApprovalsAfterLoad()) await this.#save();
     } catch (error) {
@@ -101,6 +105,20 @@ export class JsonStateStore {
     await this.#save();
   }
 
+  getDeliveryProgress(key) {
+    return this.pendingDeliveries[key];
+  }
+
+  async setDeliveryProgress(key, progress) {
+    this.pendingDeliveries[key] = progress;
+    await this.#save();
+  }
+
+  async deleteDeliveryProgress(key) {
+    delete this.pendingDeliveries[key];
+    await this.#save();
+  }
+
   #pruneExpiredApprovals(now = Date.now()) {
     let changed = false;
     for (const [token, approval] of Object.entries(this.pendingApprovals)) {
@@ -115,6 +133,11 @@ export class JsonStateStore {
   #prepareApprovalsAfterLoad() {
     let changed = this.#pruneExpiredApprovals();
     for (const approval of Object.values(this.pendingApprovals)) {
+      if (approval?.type === "routine-widget" && approval.submitted === true
+        && typeof approval.clientNonce === "string" && !approval.submissionIntent) {
+        approval.submissionIntent = true;
+        changed = true;
+      }
       if (approval?.type === "routine-widget" && approval.resolving === true) {
         approval.resolving = false;
         changed = true;
@@ -132,6 +155,7 @@ export class JsonStateStore {
         pendingApprovals: this.pendingApprovals,
         ...(this.mirrorEnabled === undefined ? {} : { mirrorEnabled: this.mirrorEnabled }),
         ...(Object.keys(this.mirrorCursors).length ? { mirrorCursors: this.mirrorCursors } : {}),
+        ...(Object.keys(this.pendingDeliveries).length ? { pendingDeliveries: this.pendingDeliveries } : {}),
       })}\n`;
       await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
       await rename(temporary, this.filename);

@@ -74,6 +74,7 @@ test("makes an interrupted submitted routine widget recoverable after restart", 
       widget: {
         type: "routine-widget",
         submitted: true,
+        clientNonce: "telegram:widget:abcdefghijklmnopqrstuvwx:0",
         resolving: true,
         expiresAt: Date.now() + 60_000,
       },
@@ -84,7 +85,29 @@ test("makes an interrupted submitted routine widget recoverable after restart", 
   await store.load();
 
   assert.equal(store.getApproval("widget").submitted, true);
+  assert.equal(store.getApproval("widget").submissionIntent, true);
   assert.equal(store.getApproval("widget").resolving, false);
+});
+
+test("persists multipart delivery progress across restart", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-delivery-"));
+  const filename = path.join(directory, "state.json");
+  const store = new JsonStateStore(filename);
+  await store.load();
+  await store.setDeliveryProgress("autonomous:chief:entry-1", {
+    nextPart: 2,
+    rootMessageId: 41,
+  });
+
+  const reloaded = new JsonStateStore(filename);
+  await reloaded.load();
+
+  assert.deepEqual(reloaded.getDeliveryProgress("autonomous:chief:entry-1"), {
+    nextPart: 2,
+    rootMessageId: 41,
+  });
+  await reloaded.deleteDeliveryProgress("autonomous:chief:entry-1");
+  assert.equal(reloaded.getDeliveryProgress("autonomous:chief:entry-1"), undefined);
 });
 
 test("quarantines malformed state and starts cleanly", async () => {

@@ -20,6 +20,7 @@ function mirrorHarness(options = {}) {
   const state = {
     selected: new Map(),
     approvals: new Map(),
+    deliveries: new Map(),
     cursors: new Map(options.cursors ?? [["chief", { initialized: true, entryId: "old" }]]),
     enabled: options.enabled ?? true,
     getAgent(chatId) { return this.selected.get(chatId); },
@@ -33,6 +34,9 @@ function mirrorHarness(options = {}) {
     getApproval(token) { return this.approvals.get(token); },
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
+    getDeliveryProgress(key) { return this.deliveries.get(key); },
+    async setDeliveryProgress(key, progress) { this.deliveries.set(key, { ...progress }); },
+    async deleteDeliveryProgress(key) { this.deliveries.delete(key); },
   };
   const telegram = {
     async sendMessage(chatId, text, sendOptions = {}) {
@@ -327,6 +331,7 @@ test("expires routine widget callbacks without sending a Grok prompt", async () 
 
 test("recovers a submitted routine widget reply through the desktop mirror", async () => {
   const harness = mirrorHarness();
+  const clientNonce = "telegram:widget:abcdefghijklmnopqrstuvwx:0";
   harness.state.approvals.set("abcdefghijklmnopqrstuvwx", {
     type: "routine-widget",
     agentId: "chief",
@@ -334,6 +339,8 @@ test("recovers a submitted routine widget reply through the desktop mirror", asy
     chatId: 99,
     userId: 42,
     messageId: 55,
+    clientNonce,
+    submissionIntent: true,
     submitted: true,
     resolving: false,
     expiresAt: Date.now() + 60_000,
@@ -341,7 +348,7 @@ test("recovers a submitted routine widget reply through the desktop mirror", asy
   harness.transcripts.get("chief").push({
     id: "widget-prompt",
     kind: "message",
-    clientNonce: "telegram:widget:abcdefghijklmnopqrstuvwx:0",
+    clientNonce,
     message: { type: "text", content: "Continue" },
   });
   harness.grok.waitForReply = async () => ({
@@ -356,6 +363,171 @@ test("recovers a submitted routine widget reply through the desktop mirror", asy
   assert.equal(harness.sent.at(-1).options.replyToMessageId, 55);
   assert.equal(harness.state.approvals.size, 0);
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+});
+
+test("reconciles a durable widget submission intent before allowing resubmission", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  harness.state.approvals.set(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    choices: [{ label: "Continue", value: "Continue" }],
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    choiceIndex: 0,
+    submissionIntent: true,
+    resolving: false,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce,
+    message: { type: "text", content: "Continue" },
+  });
+  let submissionCount = 0;
+  harness.grok.sendPrompt = async () => { submissionCount += 1; };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Recovered without resubmitting",
+    attachments: [],
+  });
+
+  await harness.bridge.handleCallbackQuery({ callback_query: {
+    id: "recovered-callback",
+    data: `gtw:${token}:0`,
+    from: { id: 42 },
+    message: { message_id: 55, chat: { id: 99, type: "private" } },
+  } });
+
+  assert.equal(submissionCount, 0);
+  assert.equal(harness.sent.at(-1).text, "Recovered without resubmitting");
+  assert.equal(harness.state.approvals.size, 0);
+});
+
+test("keeps cursor advancement in ordered mirror processing after a widget choice", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "routine-widget",
+    kind: "send-message",
+    message: { type: "widget", widget: {
+      prompt: "Choose",
+      options: [{ label: "Continue", value: "Continue" }],
+    } },
+  });
+  await harness.bridge.pollDesktopMirrorOnce();
+  const callbackData = harness.sent[0].options.inlineKeyboard[0][0].callback_data;
+  const clientNonce = callbackData.replace(/^gtw:/, "telegram:widget:");
+  harness.grok.sendPrompt = async () => {
+    harness.transcripts.get("chief").push(
+      { id: "intervening-routine", kind: "send-message", message: { type: "text", content: "Intervening routine" } },
+      { id: "widget-prompt", kind: "message", clientNonce, message: { type: "text", content: "Continue" } },
+    );
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Choice reply",
+    attachments: [],
+  });
+
+  await harness.bridge.handleCallbackQuery({ callback_query: {
+    id: "choice",
+    data: callbackData,
+    from: { id: 42 },
+    message: { message_id: harness.sent[0].message_id, chat: { id: 99, type: "private" } },
+  } });
+
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-widget");
+  await harness.bridge.pollDesktopMirrorOnce();
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "intervening-routine");
+  assert.equal(harness.sent.filter(({ text }) => /Intervening routine/.test(text)).length, 1);
+  await harness.bridge.pollDesktopMirrorOnce();
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+});
+
+test("retries only undelivered autonomous multipart parts", async () => {
+  const harness = mirrorHarness();
+  harness.transcripts.get("chief").push({
+    id: "routine-multipart",
+    kind: "send-message",
+    message: {
+      type: "text",
+      content: "Routine report",
+      images: [
+        { url: "/output/one.png" },
+        { url: "/output/two.png" },
+      ],
+    },
+  });
+  const originalSendAttachment = harness.telegram.sendAttachment;
+  let attachmentAttempts = 0;
+  harness.telegram.sendAttachment = async (...args) => {
+    attachmentAttempts += 1;
+    if (attachmentAttempts === 2) throw new Error("Telegram attachment failed");
+    return originalSendAttachment(...args);
+  };
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /attachment failed/);
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.filter(({ text }) => /Routine report/.test(text)).length, 1);
+  assert.deepEqual(harness.attachments.map(({ attachment }) => attachment.filename), ["one.png", "two.png"]);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "routine-multipart");
+  assert.equal(harness.state.deliveries.size, 0);
+});
+
+test("retries only undelivered recovered widget reply parts", async () => {
+  const harness = mirrorHarness();
+  const token = "abcdefghijklmnopqrstuvwx";
+  const clientNonce = `telegram:widget:${token}:0`;
+  harness.state.approvals.set(token, {
+    type: "routine-widget",
+    agentId: "chief",
+    entryId: "routine-widget",
+    chatId: 99,
+    userId: 42,
+    messageId: 55,
+    clientNonce,
+    submissionIntent: true,
+    submitted: true,
+    resolving: false,
+    expiresAt: Date.now() + 60_000,
+  });
+  harness.transcripts.get("chief").push({
+    id: "widget-prompt",
+    kind: "message",
+    clientNonce,
+    message: { type: "text", content: "Continue" },
+  });
+  harness.grok.waitForReply = async () => ({
+    messageId: "widget-reply",
+    text: "Widget report",
+    attachments: [
+      { path: "/output/one.png", filename: "one.png" },
+      { path: "/output/two.png", filename: "two.png" },
+    ],
+  });
+  const originalSendAttachment = harness.telegram.sendAttachment;
+  let attachmentAttempts = 0;
+  harness.telegram.sendAttachment = async (...args) => {
+    attachmentAttempts += 1;
+    if (attachmentAttempts === 2) throw new Error("Telegram attachment failed");
+    return originalSendAttachment(...args);
+  };
+
+  await assert.rejects(harness.bridge.pollDesktopMirrorOnce(), /attachment failed/);
+  assert.equal(harness.sent.filter(({ text }) => text === "Widget report").length, 1);
+  harness.state.approvals.get(token).resolving = false;
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.filter(({ text }) => text === "Widget report").length, 1);
+  assert.deepEqual(harness.attachments.map(({ attachment }) => attachment.filename), ["one.png", "two.png"]);
+  assert.equal(harness.state.getMirrorCursor("chief").entryId, "widget-reply");
+  assert.equal(harness.state.deliveries.size, 0);
 });
 
 test("skips a Telegram-originated prompt and its complete response turn", async () => {
