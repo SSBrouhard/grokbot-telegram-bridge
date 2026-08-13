@@ -43,7 +43,7 @@ Treat Telegram account security as part of this boundary. Enable Telegram two-st
 
 Copy the project onto the Grok computer persistent volume. The control script default is `/home/box/grokbot-telegram-bridge`. If you already installed under another path, export `BRIDGE_HOME` instead of moving files.
 
-Grok Bot's built-in **Computer** view can be helpful for opening a terminal and completing setup, but it is optional. The bridge does not use GUI automation and does not require the desktop app or Computer view to remain open after installation.
+Optional: a coding agent with computer-use capabilities (such as Codex Computer Use or another CUA driver) can help operate Grok Bot's **Computer** view, run these installation commands, configure the recovery routine, and verify the Telegram flow. Computer use is a setup convenience, not a bridge dependency. Enter credentials yourself when practical and do not let an agent print tokens into logs or chat.
 
 ```sh
 git clone https://github.com/ssbrouhard/grokbot-telegram-bridge.git /home/box/grokbot-telegram-bridge
