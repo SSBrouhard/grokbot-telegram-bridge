@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import { buildRichText, findStructuredReferences } from "./grok-rich-text.js";
 
 const HELP = [
@@ -7,6 +8,7 @@ const HELP = [
   "/agents - list agents",
   "/use <exact name> - select an agent",
   "/status - show the selected agent",
+  "/mirror status|on|off - control configured desktop mirroring",
   "/skills - list the selected agent's live skills",
   "/run <exact skill> [request] - run a skill",
   "/routines - list routines available to @ mention",
@@ -136,8 +138,26 @@ function routineDescription(routine) {
 }
 
 export class Bridge {
-  constructor({ telegram, grok, state, allowedUserIds, allowedChatIds, defaultAgent }) {
-    Object.assign(this, { telegram, grok, state, allowedUserIds, allowedChatIds, defaultAgent });
+  constructor({
+    telegram,
+    grok,
+    state,
+    allowedUserIds,
+    allowedChatIds,
+    defaultAgent,
+    mirrorChatId,
+    mirrorUserId,
+  }) {
+    Object.assign(this, {
+      telegram,
+      grok,
+      state,
+      allowedUserIds,
+      allowedChatIds,
+      defaultAgent,
+      mirrorChatId,
+      mirrorUserId,
+    });
   }
 
   isAuthorized(message) {
@@ -160,6 +180,87 @@ export class Bridge {
     return agents.find((agent) => normalize(agent.name) === normalize(this.defaultAgent));
   }
 
+  isMirrorConfigured() {
+    return this.mirrorChatId !== undefined && this.mirrorUserId !== undefined;
+  }
+
+  isMirrorController(message) {
+    return this.isMirrorConfigured()
+      && message?.chat?.id === this.mirrorChatId
+      && message?.from?.id === this.mirrorUserId;
+  }
+
+  mirrorEnabled() {
+    return this.state.isMirrorEnabled(this.isMirrorConfigured());
+  }
+
+  async getTranscriptEntries(agentId, options = {}) {
+    try {
+      return await this.grok.getTranscriptTail(agentId, 200, options);
+    } catch (error) {
+      if (!/HTTP 404$/.test(error.message)) throw error;
+      return this.grok.getTranscript(agentId, options);
+    }
+  }
+
+  async ensureMirrorBaseline(agentId, options = {}) {
+    if (!options.force && this.state.getMirrorCursor(agentId)) return false;
+    const entries = await this.getTranscriptEntries(agentId, options);
+    const newestId = [...entries].reverse().find((entry) => typeof entry?.id === "string" && entry.id)?.id;
+    await this.state.setMirrorCursor(agentId, newestId);
+    return true;
+  }
+
+  async handleMirrorCommand(message, argument, options = {}) {
+    if (!this.isMirrorConfigured()) {
+      await this.telegram.sendMessage(
+        message.chat.id,
+        "Desktop mirroring is not configured. Set both GROK_DESKTOP_MIRROR_CHAT_ID and GROK_DESKTOP_MIRROR_USER_ID in .env, then restart the bridge.",
+        options,
+      );
+      return;
+    }
+    if (!this.isMirrorController(message)) {
+      await this.telegram.sendMessage(
+        message.chat.id,
+        "Only the configured desktop-mirror user in the configured mirror chat can control mirroring.",
+        options,
+      );
+      return;
+    }
+    const action = argument.toLocaleLowerCase();
+    if (!action || action === "status") {
+      await this.telegram.sendMessage(
+        message.chat.id,
+        `Desktop mirroring is ${this.mirrorEnabled() ? "on" : "off"}.`,
+        options,
+      );
+      return;
+    }
+    if (action === "off") {
+      await this.state.setMirrorEnabled(false);
+      await this.telegram.sendMessage(message.chat.id, "Desktop mirroring is off.", options);
+      return;
+    }
+    if (action === "on") {
+      const agents = await this.grok.listAgents(options);
+      const agent = this.resolveAgent(this.mirrorChatId, agents);
+      if (!agent) {
+        await this.telegram.sendMessage(
+          message.chat.id,
+          "Could not find the selected mirror agent. Use /agents and /use before enabling mirroring.",
+          options,
+        );
+        return;
+      }
+      await this.ensureMirrorBaseline(agent.id, { ...options, force: true });
+      await this.state.setMirrorEnabled(true);
+      await this.telegram.sendMessage(message.chat.id, `Desktop mirroring is on for ${agent.name}.`, options);
+      return;
+    }
+    await this.telegram.sendMessage(message.chat.id, "Use /mirror status, /mirror on, or /mirror off.", options);
+  }
+
   async handleUpdate(update, options = {}) {
     const message = update?.message;
     if (!this.isAuthorized(message)) return;
@@ -179,6 +280,11 @@ export class Bridge {
       return;
     }
 
+    if (command === "/mirror") {
+      await this.handleMirrorCommand(message, rawArguments.join(" ").trim(), options);
+      return;
+    }
+
     const agents = await this.grok.listAgents(options);
     if (command === "/agents") {
       const selected = this.resolveAgent(chatId, agents);
@@ -193,6 +299,9 @@ export class Bridge {
       if (!agent) {
         await this.telegram.sendMessage(chatId, "No exact agent-name match. Use /agents to see available names.", options);
         return;
+      }
+      if (this.isMirrorConfigured() && chatId === this.mirrorChatId) {
+        await this.ensureMirrorBaseline(agent.id, options);
       }
       await this.state.setAgent(chatId, agent.id);
       await this.telegram.sendMessage(chatId, `Now using ${agent.name}.`, options);
@@ -349,6 +458,120 @@ export class Bridge {
       await this.telegram.sendAttachment(chatId, { ...attachment, bytes }, replyOptions);
     }
     await this.telegram.setMessageReaction?.(chatId, message.message_id, "✅", options).catch(() => {});
+  }
+
+  async pollDesktopMirrorOnce(options = {}) {
+    if (!this.mirrorEnabled()) return;
+    const agents = await this.grok.listAgents(options);
+    const agent = this.resolveAgent(this.mirrorChatId, agents);
+    if (!agent) throw new Error("Desktop mirror agent is unavailable");
+    if (await this.ensureMirrorBaseline(agent.id, options)) return;
+
+    let entries = await this.getTranscriptEntries(agent.id, options);
+    const cursor = this.state.getMirrorCursor(agent.id);
+    let cursorIndex = cursor?.entryId === null
+      ? -1
+      : entries.findIndex((entry) => entry?.id === cursor?.entryId);
+    if (cursor?.entryId && cursorIndex < 0) {
+      entries = await this.grok.getTranscript(agent.id, options);
+      cursorIndex = entries.findIndex((entry) => entry?.id === cursor.entryId);
+      if (cursorIndex < 0) {
+        await this.ensureMirrorBaseline(agent.id, { ...options, force: true });
+        return;
+      }
+    }
+    const unseen = entries.slice(cursorIndex + 1);
+    if (!unseen.length) return;
+    const promptIndex = unseen.findIndex((entry) => entry?.kind === "message"
+      && typeof entry?.id === "string" && entry.id);
+    if (promptIndex < 0) return;
+    await this.mirrorDesktopTurn(agent, unseen[promptIndex], options);
+  }
+
+  async mirrorDesktopTurn(agent, promptEntry, options = {}) {
+    const clientNonce = typeof promptEntry?.clientNonce === "string" ? promptEntry.clientNonce : undefined;
+    const waitOptions = { ...options, promptEntryId: promptEntry.id };
+    if (clientNonce?.startsWith("telegram:")) {
+      const skippedReply = await this.grok.waitForReply(agent.id, clientNonce, waitOptions);
+      if (typeof skippedReply?.messageId === "string" && skippedReply.messageId) {
+        await this.state.setMirrorCursor(agent.id, skippedReply.messageId);
+      }
+      return;
+    }
+
+    const prompt = this.grok.getPromptContent(promptEntry) ?? {
+      text: "",
+      attachments: [],
+      unavailableAttachmentCount: 0,
+    };
+    const attachmentNotice = prompt.unavailableAttachmentCount > 0
+      ? `\n\n[${prompt.unavailableAttachmentCount} desktop attachment${prompt.unavailableAttachmentCount === 1 ? " is" : "s are"} unavailable through the gateway transcript.]`
+      : "";
+    const promptText = prompt.text || "[Desktop prompt text is unavailable through the gateway transcript.]";
+    const mirroredPrompt = await this.telegram.sendMessage(
+      this.mirrorChatId,
+      `🖥️ Desktop · ${agent.name}\n\n${promptText}${attachmentNotice}`,
+      options,
+    );
+    if (!Number.isSafeInteger(mirroredPrompt?.message_id)) {
+      throw new Error("Telegram returned no message ID for the mirrored desktop prompt");
+    }
+    const replyOptions = { ...options, replyToMessageId: mirroredPrompt.message_id };
+    for (const attachment of prompt.attachments ?? []) {
+      const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
+      await this.telegram.sendAttachment(
+        this.mirrorChatId,
+        { ...attachment, bytes, caption: attachment.caption || "Desktop prompt attachment" },
+        replyOptions,
+      );
+    }
+    const reply = await this.grok.waitForReply(agent.id, clientNonce, {
+      ...waitOptions,
+      onApproval: (entry) => this.sendApproval(this.mirrorChatId, agent.id, entry, {
+        ...options,
+        approvalUserId: this.mirrorUserId,
+        replyToMessageId: mirroredPrompt.message_id,
+      }),
+    });
+    if (reply.text) {
+      await this.telegram.sendMessage(this.mirrorChatId, reply.text, replyOptions);
+    }
+    for (const attachment of reply.attachments ?? []) {
+      const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
+      await this.telegram.sendAttachment(this.mirrorChatId, { ...attachment, bytes }, replyOptions);
+    }
+    if (!reply.text && !(reply.attachments ?? []).length) {
+      await this.telegram.sendMessage(this.mirrorChatId, "Grok completed without a Telegram-renderable response.", replyOptions);
+    }
+    if (typeof reply?.messageId !== "string" || !reply.messageId) {
+      throw new Error("Grok returned no transcript cursor for the mirrored desktop response");
+    }
+    await this.state.setMirrorCursor(agent.id, reply.messageId);
+  }
+
+  async runDesktopMirror(options = {}) {
+    if (!this.isMirrorConfigured()) return;
+    let consecutiveFailures = 0;
+    while (!options.signal?.aborted) {
+      try {
+        await this.pollDesktopMirrorOnce(options);
+        consecutiveFailures = 0;
+      } catch (error) {
+        if (options.signal?.aborted || error.name === "AbortError") break;
+        consecutiveFailures += 1;
+        console.error("Desktop mirror polling failed:", error.message);
+      }
+      const normalDelay = this.grok.pollIntervalMs ?? 1_000;
+      const delayMs = consecutiveFailures
+        ? Math.min(normalDelay * (2 ** (consecutiveFailures - 1)), 30_000)
+        : normalDelay;
+      try {
+        await sleep(delayMs, undefined, { signal: options.signal });
+      } catch (error) {
+        if (options.signal?.aborted || error.name === "AbortError") break;
+        throw error;
+      }
+    }
   }
 
   async sendApproval(chatId, agentId, entry, options = {}) {

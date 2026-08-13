@@ -23,6 +23,31 @@ test("loads a locked-down configuration", () => {
   assert.equal(config.defaultAgent, "Chief of Staff");
 });
 
+test("loads paired desktop mirror IDs only when both are allowlisted", () => {
+  const config = loadConfig({
+    ...valid,
+    GROK_DESKTOP_MIRROR_CHAT_ID: "99",
+    GROK_DESKTOP_MIRROR_USER_ID: "42",
+  });
+  assert.equal(config.mirrorChatId, 99);
+  assert.equal(config.mirrorUserId, 42);
+
+  assert.throws(() => loadConfig({
+    ...valid,
+    GROK_DESKTOP_MIRROR_CHAT_ID: "99",
+  }), /must be set together/);
+  assert.throws(() => loadConfig({
+    ...valid,
+    GROK_DESKTOP_MIRROR_CHAT_ID: "100",
+    GROK_DESKTOP_MIRROR_USER_ID: "42",
+  }), /CHAT_ID must be in TELEGRAM_ALLOWED_CHAT_IDS/);
+  assert.throws(() => loadConfig({
+    ...valid,
+    GROK_DESKTOP_MIRROR_CHAT_ID: "99",
+    GROK_DESKTOP_MIRROR_USER_ID: "44",
+  }), /USER_ID must be in TELEGRAM_ALLOWED_USER_IDS/);
+});
+
 for (const key of [
   "TELEGRAM_BOT_TOKEN",
   "TELEGRAM_ALLOWED_USER_IDS",

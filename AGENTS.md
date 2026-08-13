@@ -2,7 +2,7 @@
 
 This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
 
-- Treat the security contracts in `README.md` and `SECURITY.md` as release invariants; their regression coverage is concentrated in `test/bridge.test.js`, `test/config.test.js`, `test/grok-client.test.js`, and `test/state.test.js`.
+- Treat the security contracts in `README.md` and `SECURITY.md` as release invariants; their regression coverage is concentrated in `test/bridge.test.js`, `test/desktop-mirror.test.js`, `test/config.test.js`, `test/grok-client.test.js`, and `test/state.test.js`.
 - Validate with `npm test` and `npm run check` on the minimum runtime declared in `package.json` before release changes.
 
 ## Maintaining this file

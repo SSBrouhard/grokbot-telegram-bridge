@@ -8,6 +8,8 @@ export class JsonStateStore {
     this.offset = 0;
     this.agentsByChat = {};
     this.pendingApprovals = {};
+    this.mirrorEnabled = undefined;
+    this.mirrorCursors = {};
     this.saveQueue = Promise.resolve();
   }
 
@@ -34,6 +36,10 @@ export class JsonStateStore {
       this.pendingApprovals = parsed.pendingApprovals && typeof parsed.pendingApprovals === "object"
         ? parsed.pendingApprovals
         : {};
+      this.mirrorEnabled = typeof parsed.mirrorEnabled === "boolean" ? parsed.mirrorEnabled : undefined;
+      this.mirrorCursors = parsed.mirrorCursors && typeof parsed.mirrorCursors === "object"
+        ? parsed.mirrorCursors
+        : {};
     } catch (error) {
       if (error.code === "ENOENT") return;
       if (!(error instanceof SyntaxError)) throw error;
@@ -49,6 +55,28 @@ export class JsonStateStore {
 
   async setAgent(chatId, agentId) {
     this.agentsByChat[String(chatId)] = agentId;
+    await this.#save();
+  }
+
+  isMirrorEnabled(configured) {
+    return configured && this.mirrorEnabled !== false;
+  }
+
+  async setMirrorEnabled(enabled) {
+    this.mirrorEnabled = enabled;
+    await this.#save();
+  }
+
+  getMirrorCursor(agentId) {
+    const cursor = this.mirrorCursors[agentId];
+    return cursor?.initialized === true ? cursor : undefined;
+  }
+
+  async setMirrorCursor(agentId, entryId) {
+    this.mirrorCursors[agentId] = {
+      initialized: true,
+      entryId: typeof entryId === "string" && entryId ? entryId : null,
+    };
     await this.#save();
   }
 
@@ -78,6 +106,8 @@ export class JsonStateStore {
         offset: this.offset,
         agentsByChat: this.agentsByChat,
         pendingApprovals: this.pendingApprovals,
+        ...(this.mirrorEnabled === undefined ? {} : { mirrorEnabled: this.mirrorEnabled }),
+        ...(Object.keys(this.mirrorCursors).length ? { mirrorCursors: this.mirrorCursors } : {}),
       })}\n`;
       await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
       await rename(temporary, this.filename);

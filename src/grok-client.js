@@ -182,6 +182,71 @@ export class GrokClient {
     return message.content?.trim() || HANDOFF_NOTICE;
   }
 
+  getPromptContent(entry) {
+    if (entry?.kind !== "message") return undefined;
+    const message = entry?.message;
+    const textCandidates = [
+      typeof entry?.prompt === "string" ? entry.prompt : undefined,
+      typeof entry?.content === "string" ? entry.content : undefined,
+      typeof entry?.text === "string" ? entry.text : undefined,
+      typeof message?.content === "string" ? message.content : undefined,
+      typeof message?.text === "string" ? message.text : undefined,
+    ];
+    const text = textCandidates.find((candidate) => candidate?.trim())?.trim() ?? "";
+    const attachments = [];
+    let unavailableAttachmentCount = 0;
+    const attachmentPaths = Array.isArray(entry?.attachmentPaths) ? entry.attachmentPaths : [];
+    const attachmentNames = Array.isArray(entry?.attachmentNames) ? entry.attachmentNames : [];
+    for (const [index, attachmentPath] of attachmentPaths.entries()) {
+      if (typeof attachmentPath !== "string" || !attachmentPath) {
+        unavailableAttachmentCount += 1;
+        continue;
+      }
+      attachments.push({
+        path: attachmentPath,
+        filename: typeof attachmentNames[index] === "string" && attachmentNames[index]
+          ? attachmentNames[index]
+          : attachmentPath.split("/").at(-1) || "desktop-attachment.bin",
+      });
+    }
+    if (attachmentNames.length > attachmentPaths.length) {
+      unavailableAttachmentCount += attachmentNames.length - attachmentPaths.length;
+    }
+    if (Array.isArray(message?.images)) {
+      for (const image of message.images) {
+        if (typeof image?.url === "string" && image.url) {
+          attachments.push({
+            path: image.url,
+            filename: image.url.split("/").at(-1) || "desktop-image.png",
+            caption: typeof image?.alt === "string" ? image.alt : undefined,
+          });
+        } else {
+          unavailableAttachmentCount += 1;
+        }
+      }
+    }
+    if (Array.isArray(entry?.attachments)) {
+      for (const attachment of entry.attachments) {
+        const attachmentPath = typeof attachment?.path === "string"
+          ? attachment.path
+          : typeof attachment?.url === "string" ? attachment.url : undefined;
+        if (!attachmentPath) {
+          unavailableAttachmentCount += 1;
+          continue;
+        }
+        attachments.push({
+          path: attachmentPath,
+          filename: (typeof attachment?.file_name === "string" && attachment.file_name)
+            || (typeof attachment?.filename === "string" && attachment.filename)
+            || attachmentPath.split("/").at(-1)
+            || "desktop-attachment.bin",
+          caption: typeof attachment?.alt === "string" ? attachment.alt : undefined,
+        });
+      }
+    }
+    return { text, attachments, unavailableAttachmentCount };
+  }
+
   getReplyContent(entries) {
     const textParts = [];
     const attachments = [];
@@ -237,18 +302,21 @@ export class GrokClient {
           if (!/HTTP 404$/.test(error.message)) throw error;
           entries = await this.getTranscript(agentId, options);
         }
-        let promptIndex = entries.findIndex((entry) => (
-          entry?.kind === "message" && entry.clientNonce === clientNonce
-        ));
+        const matchesPrompt = (entry) => entry?.kind === "message"
+          && ((typeof clientNonce === "string" && entry?.clientNonce === clientNonce)
+            || (typeof options.promptEntryId === "string" && entry?.id === options.promptEntryId));
+        let promptIndex = entries.findIndex(matchesPrompt);
         if (promptIndex < 0 && !promptObserved) {
           entries = await this.getTranscript(agentId, options);
-          promptIndex = entries.findIndex((entry) => (
-            entry?.kind === "message" && entry.clientNonce === clientNonce
-          ));
+          promptIndex = entries.findIndex(matchesPrompt);
         }
         if (promptIndex >= 0) {
           promptObserved = true;
-          const replyEntries = entries.slice(promptIndex + 1).filter((entry) => entry?.kind === "send-message");
+          const nextPromptOffset = entries.slice(promptIndex + 1)
+            .findIndex((entry) => entry?.kind === "message");
+          const turnEnd = nextPromptOffset < 0 ? entries.length : promptIndex + 1 + nextPromptOffset;
+          const replyEntries = entries.slice(promptIndex + 1, turnEnd)
+            .filter((entry) => entry?.kind === "send-message");
           for (const entry of replyEntries) {
             const pendingAutoReview = entry.message?.type === "auto-review-approval"
               && entry.message.approval?.status === "pending";
@@ -268,7 +336,7 @@ export class GrokClient {
             } else if (busyReplyObserved) {
               return { messageId: replyEntries.at(-1).id, ...this.getReplyContent(replyEntries) };
             } else {
-              const signature = replyEntries.map((entry) => entry.id).join(":");
+              const signature = replyEntries.map((entry, index) => entry?.id ?? `entry-${index}`).join(":");
               if (signature !== stableReplySignature) {
                 stableReplySignature = signature;
                 stableReplySince = Date.now();

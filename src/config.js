@@ -16,6 +16,15 @@ function parseIds(env, name) {
   return new Set(values.map(Number));
 }
 
+function optionalId(env, name) {
+  const raw = env[name]?.trim();
+  if (!raw) return undefined;
+  if (!/^-?\d+$/.test(raw)) throw new Error(`${name} must be a numeric ID`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) throw new Error(`${name} must be a safe numeric ID`);
+  return value;
+}
+
 function positiveInteger(env, name, fallback) {
   const raw = env[name]?.trim();
   if (!raw) return fallback;
@@ -60,15 +69,31 @@ export function loadConfig(env = process.env) {
     throw new Error("GROK_GATEWAY_URL must use a loopback host");
   }
 
+  const allowedUserIds = parseIds(env, "TELEGRAM_ALLOWED_USER_IDS");
+  const allowedChatIds = parseIds(env, "TELEGRAM_ALLOWED_CHAT_IDS");
+  const mirrorChatId = optionalId(env, "GROK_DESKTOP_MIRROR_CHAT_ID");
+  const mirrorUserId = optionalId(env, "GROK_DESKTOP_MIRROR_USER_ID");
+  if ((mirrorChatId === undefined) !== (mirrorUserId === undefined)) {
+    throw new Error("GROK_DESKTOP_MIRROR_CHAT_ID and GROK_DESKTOP_MIRROR_USER_ID must be set together");
+  }
+  if (mirrorChatId !== undefined && !allowedChatIds.has(mirrorChatId)) {
+    throw new Error("GROK_DESKTOP_MIRROR_CHAT_ID must be in TELEGRAM_ALLOWED_CHAT_IDS");
+  }
+  if (mirrorUserId !== undefined && !allowedUserIds.has(mirrorUserId)) {
+    throw new Error("GROK_DESKTOP_MIRROR_USER_ID must be in TELEGRAM_ALLOWED_USER_IDS");
+  }
+
   return {
     telegramToken: required(env, "TELEGRAM_BOT_TOKEN"),
-    allowedUserIds: parseIds(env, "TELEGRAM_ALLOWED_USER_IDS"),
-    allowedChatIds: parseIds(env, "TELEGRAM_ALLOWED_CHAT_IDS"),
+    allowedUserIds,
+    allowedChatIds,
     gatewayUrl,
     gatewayToken: gatewayToken(env),
     defaultAgent: env.GROK_DEFAULT_AGENT?.trim() || "Chief of Staff",
     statePath: path.resolve(env.BRIDGE_STATE_PATH?.trim() || "bridge-state.json"),
     replyTimeoutMs: positiveInteger(env, "GROK_REPLY_TIMEOUT_MS", 10 * 60_000),
     pollIntervalMs: positiveInteger(env, "GROK_POLL_INTERVAL_MS", 1_000),
+    mirrorChatId,
+    mirrorUserId,
   };
 }

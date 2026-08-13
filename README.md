@@ -11,8 +11,9 @@ If `TELEGRAM_ALLOWED_USER_IDS` or `TELEGRAM_ALLOWED_CHAT_IDS` is wrong, the bot 
 - Accepts text, photos, voice notes, audio, video, and file attachments from explicitly allowed private chats. Public Bot API downloads and uploads are capped at 20 MB.
 - Sends each prompt to **Chief of Staff** by default, or to another agent selected with `/use`.
 - Returns the correlated reply, including Grok files and images when the gateway exposes them.
+- Optionally mirrors desktop-originated prompts and completed replies into one configured Telegram chat, with each reply threaded under its desktop prompt.
 - Relays current auto-review and local-computer permission requests with only **Approve once** and **Deny**.
-- Persists Telegram offsets, per-chat agent selection, and pending approvals so a restart does not lose that state.
+- Persists Telegram offsets, per-chat agent selection, desktop-mirror cursors and override, and pending approvals so a restart does not lose that state.
 
 Voice notes are forwarded with an explicit transcription instruction. Replies use safe Telegram HTML when the conversion succeeds, otherwise plain text. The bridge sends typing actions and success or error reactions. It does not stream partial responses and does not support Telegram topics, groups, channels, or webhooks.
 
@@ -34,7 +35,7 @@ Keep both allowlists set and narrow. Every inbound update must be a **private** 
 
 The gateway discovery record and any existing bridge state file must be regular, non-symlink files with no group or other permissions (mode `600` is recommended). New state, log, PID, and control-lock files created by the control script are owner-only.
 
-Approval buttons are bound to the initiating user, chat, Telegram message, Grok agent, transcript entry, and request ID. The bridge rechecks that the Grok request is still pending before applying a decision. Approvals survive process restarts, expire after 10 minutes, and never map to Grok's persistent `always` or `never` values.
+Approval buttons are bound to the initiating user, chat, Telegram message, Grok agent, transcript entry, and request ID. For a desktop-mirrored turn, the initiating identity is the configured mirror user and chat. The bridge rechecks that the Grok request is still pending before applying a decision. Approvals survive process restarts, expire after 10 minutes, and never map to Grok's persistent `always` or `never` values.
 
 Treat Telegram account security as part of this boundary. Enable Telegram two-step verification and a device passcode. Do not send passwords, API keys, or other secrets through the bot.
 
@@ -56,6 +57,12 @@ There is no `npm install`. Edit `.env`:
 2. Leave `GROK_GATEWAY_URL` on loopback.
 3. Point `GROK_GATEWAY_TOKEN_FILE` at the mode-`600` `gateway.json` (or set `GROK_GATEWAY_TOKEN` if you must inject the token another way).
 4. Set `BRIDGE_STATE_PATH` to a file on the persistent volume. The bridge creates it with mode `600`; tighten an existing file with `chmod 600` before startup.
+
+To enable desktop mirroring, also set both `GROK_DESKTOP_MIRROR_CHAT_ID` and `GROK_DESKTOP_MIRROR_USER_ID`. The chat ID must already be in `TELEGRAM_ALLOWED_CHAT_IDS`, and the user ID must already be in `TELEGRAM_ALLOWED_USER_IDS`; startup fails if the pair is incomplete or outside either allowlist. Omitting both disables the watcher.
+
+On its first watch of an agent, the bridge records that agent's newest transcript entry and sends no history. It watches the agent selected with `/use` for the configured mirror chat, falling back to `GROK_DEFAULT_AGENT`. Selecting an agent that has never been watched baselines it before switching; switching back resumes its durable cursor. Prompts created by this bridge have a `telegram:` client nonce, so their entire turns are excluded from desktop mirroring to prevent duplicate replies and feedback loops.
+
+Desktop prompt text, completed Markdown replies, images, and files are mirrored when the local gateway transcript exposes readable data. If attachment metadata is visible but no readable gateway path is available, Telegram receives an explicit unavailable-attachment notice. Partial progress is not used as the final response. The mirror watcher retries independently with bounded backoff, so a slow or temporarily unavailable desktop turn does not stop Telegram polling, commands, callbacks, or other chats.
 
 Grok currently writes `gateway.json` as mode `644` even though it contains a bearer token. The bridge will not read that file until you tighten it to `600`. Recheck the mode after a Grok computer update; the platform may recreate it.
 
@@ -96,6 +103,7 @@ The Grok computer has no systemd, supervisord, or PM2. A background process can 
 | `/agents` | List Grok agents; `*` marks the selected one |
 | `/use <exact name>` | Select an agent for this chat |
 | `/status` | Show the selected agent and whether it is working or idle |
+| `/mirror status`, `/mirror on`, `/mirror off` | Inspect or persistently control desktop mirroring; only the configured mirror user in the configured mirror chat may use these |
 | `/skills [search]` | List up to 20 matching live skills |
 | `/run <exact skill> [request]` | Run a live skill through Grok's structured composer format |
 | `/<skill-name> [request]` | Run a single-token skill directly, including hyphenated names |
@@ -147,6 +155,8 @@ Logs are `bridge.log` next to the process. They include operational errors and o
 - Chat Settings, General Settings, and Usage & Billing stay in the Grok desktop UI.
 - Account-plugin `@` mentions cannot be built from the current gateway.
 - A crash can redeliver a Telegram update. A reply can also repeat if Telegram accepted it just before the process died.
+- Desktop mirroring is also at-least-once: its per-agent cursor advances only after the prompt, final response, and attachments are accepted by Telegram. A crash immediately after acceptance can therefore duplicate that turn.
+- The gateway transcript shape is unofficial. Optional desktop prompt text and attachment fields are read only when present; otherwise the bridge sends an explicit unavailable-content notice.
 
 ## License
 

@@ -29,6 +29,21 @@ test("persists Telegram offset and selected agent atomically", async () => {
   });
 });
 
+test("persists per-agent mirror cursors and the enabled override across restart", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-mirror-"));
+  const filename = path.join(directory, "state.json");
+  const store = new JsonStateStore(filename);
+  await store.load();
+  await store.setMirrorCursor("chief", "entry-42");
+  await store.setMirrorEnabled(false);
+
+  const reloaded = new JsonStateStore(filename);
+  await reloaded.load();
+  assert.deepEqual(reloaded.getMirrorCursor("chief"), { initialized: true, entryId: "entry-42" });
+  assert.equal(reloaded.isMirrorEnabled(true), false);
+  assert.equal(reloaded.isMirrorEnabled(false), false);
+});
+
 test("quarantines malformed state and starts cleanly", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-"));
   const filename = path.join(directory, "state.json");

@@ -22,6 +22,8 @@ const bridge = new Bridge({
   allowedUserIds: config.allowedUserIds,
   allowedChatIds: config.allowedChatIds,
   defaultAgent: config.defaultAgent,
+  mirrorChatId: config.mirrorChatId,
+  mirrorUserId: config.mirrorUserId,
 });
 const dispatcher = new UpdateDispatcher(bridge);
 
@@ -30,6 +32,7 @@ await telegram.setMyCommands([
   { command: "agents", description: "List Grok agents" },
   { command: "use", description: "Select a Grok agent" },
   { command: "status", description: "Show selected agent status" },
+  { command: "mirror", description: "Control desktop mirroring" },
   { command: "skills", description: "List Grok skills" },
   { command: "run", description: "Run a Grok skill" },
   { command: "routines", description: "List mentionable routines" },
@@ -49,6 +52,9 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 console.log("grokbot-telegram-bridge started");
+const mirrorTask = bridge.runDesktopMirror({ signal: shutdown.signal }).catch((error) => {
+  if (!stopping && error.name !== "AbortError") console.error("Desktop mirror stopped:", error.message);
+});
 let consecutiveFailures = 0;
 let fetchOffset = state.offset;
 const pendingCommits = [];
@@ -98,4 +104,5 @@ while (!stopping) {
 
 await dispatcher.drain();
 await commitQueue;
+await mirrorTask;
 console.log("grokbot-telegram-bridge stopped");
