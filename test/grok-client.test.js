@@ -301,6 +301,87 @@ test("waits through progress messages and returns the final text plus turn attac
   });
 });
 
+test("uses a frozen completed reply boundary without absorbing later output", async () => {
+  const entries = [
+    { id: "prompt", kind: "message", clientNonce: "wanted" },
+    { id: "progress", kind: "send-message", message: { type: "text", content: "Working" } },
+    { id: "reply", kind: "send-message", message: { type: "text", content: "Desktop reply" } },
+    { id: "routine", kind: "send-message", message: { type: "text", content: "Scheduled output" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ entries }),
+    }),
+  });
+
+  assert.deepEqual(await client.waitForReply("a1", "wanted", { completedReplyMessageId: "reply" }), {
+    messageId: "reply",
+    text: "Desktop reply",
+    attachments: [],
+  });
+});
+
+test("freezes the live completion candidate before scheduled output appears", async () => {
+  let statusCalls = 0;
+  const entries = [
+    { id: "prompt", kind: "message", clientNonce: "wanted" },
+    { id: "reply", kind: "send-message", message: { type: "text", content: "Prompt reply" } },
+    { id: "scheduled", kind: "send-message", message: { type: "text", content: "Scheduled output" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => url.endsWith("/listAgents")
+        ? ({ agents: [{
+          id: "a1",
+          isRunning: ++statusCalls === 1,
+          lastMessageId: statusCalls === 1 ? "reply" : "scheduled",
+        }] })
+        : ({ entries }),
+    }),
+  });
+
+  assert.deepEqual(await client.waitForReply("a1", "wanted"), {
+    messageId: "reply",
+    text: "Prompt reply",
+    attachments: [],
+  });
+});
+
+test("does not infer reply ownership from the current lastMessageId after idle", async () => {
+  let statusCalls = 0;
+  const entries = [
+    { id: "prompt", kind: "message", clientNonce: "wanted" },
+    { id: "reply", kind: "send-message", message: { type: "text", content: "Owned reply" } },
+    { id: "later", kind: "send-message", message: { type: "text", content: "Later output" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => url.endsWith("/listAgents")
+        ? ({ agents: [{
+          id: "a1",
+          isRunning: ++statusCalls === 1,
+          lastMessageId: statusCalls === 1 ? "reply" : "later",
+        }] })
+        : ({ entries }),
+    }),
+  });
+
+  assert.deepEqual(await client.waitForReply("a1", "wanted"), {
+    messageId: "reply",
+    text: "Owned reply",
+    attachments: [],
+  });
+});
+
 test("announces a pending approval once while continuing to wait", async () => {
   let transcriptCall = 0;
   let statusCall = 0;

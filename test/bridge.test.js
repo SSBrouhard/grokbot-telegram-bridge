@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Bridge } from "../src/bridge.js";
+import { GrokClient } from "../src/grok-client.js";
 
 function makeHarness() {
   const sent = [];
@@ -36,17 +37,61 @@ function makeHarness() {
       return { messageId: "new", text: "Finished." };
     },
     uploadAttachment: async (_agentId, filename) => `/attachments/${filename}`,
+    getTranscriptTail: async () => [],
+    getTranscript: async () => [],
+    getReplyContent: GrokClient.prototype.getReplyContent,
+    readAttachment: async () => new Uint8Array([1, 2, 3]),
   };
   const state = {
     offset: 0,
     selected: new Map(),
+    promptContexts: new Map(),
+    promptBoundaries: new Map(),
+    deliveries: new Map(),
     getAgent(chatId) { return this.selected.get(chatId); },
     async setAgent(chatId, agentId) { this.selected.set(chatId, agentId); },
+    isMirrorEnabled(configured) { return configured && this.enabled !== false; },
     async setOffset(offset) { this.offset = offset; },
     approvals: new Map(),
     getApproval(token) { return this.approvals.get(token); },
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
+    getPromptContext(agentId, clientNonce) {
+      return this.promptContexts.get(`${agentId}:${clientNonce}`);
+    },
+    listPromptContextAgentIds() {
+      return [...new Set([...this.promptContexts.keys()].map((key) => key.split(":", 1)[0]))];
+    },
+    listPromptContexts(agentId) {
+      return [...this.promptContexts.entries()]
+        .filter(([key]) => key.startsWith(`${agentId}:`))
+        .map(([key, context]) => ({ clientNonce: key.slice(agentId.length + 1), ...context }));
+    },
+    async setPromptContext(agentId, clientNonce, context) {
+      this.promptContexts.set(`${agentId}:${clientNonce}`, { ...context });
+    },
+    async deletePromptContext(agentId, clientNonce) {
+      this.promptContexts.delete(`${agentId}:${clientNonce}`);
+    },
+    getPromptTurnBoundary(agentId, clientNonce) {
+      return this.promptBoundaries.get(`${agentId}:${clientNonce}`);
+    },
+    async setPromptTurnBoundary(agentId, clientNonce, entryId) {
+      this.promptBoundaries.set(`${agentId}:${clientNonce}`, entryId);
+      return true;
+    },
+    async deletePromptTurnBoundary(agentId, clientNonce) {
+      this.promptBoundaries.delete(`${agentId}:${clientNonce}`);
+    },
+    async retirePromptTurn(agentId, clientNonce) {
+      this.promptBoundaries.delete(`${agentId}:${clientNonce}`);
+      this.promptContexts.delete(`${agentId}:${clientNonce}`);
+    },
+    listPromptTurnBoundaryAgentIds() { return []; },
+    listPromptTurnBoundaries() { return []; },
+    getDeliveryProgress(key) { return this.deliveries.get(key); },
+    async setDeliveryProgress(key, progress) { this.deliveries.set(key, { ...progress }); },
+    async deleteDeliveryProgress(key) { this.deliveries.delete(key); },
   };
   const bridge = new Bridge({
     telegram,

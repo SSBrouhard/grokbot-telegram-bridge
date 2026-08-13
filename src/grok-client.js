@@ -285,9 +285,25 @@ export class GrokClient {
   }
 
   async isAgentBusy(agentId, options = {}) {
-    const agents = await this.listAgents(options);
-    const agent = agents.find((candidate) => candidate.id === agentId);
+    const agent = await this.getAgentStatus(agentId, options);
     return agent?.isRunning === true || agent?.isComposingMessage === true;
+  }
+
+  async getAgentStatus(agentId, options = {}) {
+    const agents = await this.listAgents(options);
+    return agents.find((candidate) => candidate.id === agentId);
+  }
+
+  replyResult(entries) {
+    const result = { messageId: entries.at(-1).id, ...this.getReplyContent(entries) };
+    Object.defineProperty(result, "entries", { value: entries });
+    return result;
+  }
+
+  ownedReplyEntries(replyEntries, completionCandidateId) {
+    if (typeof completionCandidateId !== "string" || !completionCandidateId) return replyEntries;
+    const completedReplyIndex = replyEntries.findIndex((entry) => entry?.id === completionCandidateId);
+    return completedReplyIndex >= 0 ? replyEntries.slice(0, completedReplyIndex + 1) : replyEntries;
   }
 
   async waitForReply(agentId, clientNonce, options = {}) {
@@ -296,6 +312,7 @@ export class GrokClient {
     let lastError;
     let promptObserved = false;
     let busyReplyObserved = false;
+    let completionCandidateId;
     let stableReplySignature;
     let stableReplySince;
     const announcedApprovals = new Set();
@@ -319,9 +336,15 @@ export class GrokClient {
         }
         if (promptIndex >= 0) {
           promptObserved = true;
+          const replyBoundaryIndex = typeof options.completedReplyMessageId === "string"
+            ? entries.findIndex((entry, index) => index > promptIndex
+              && entry?.id === options.completedReplyMessageId)
+            : -1;
           const nextPromptOffset = entries.slice(promptIndex + 1)
             .findIndex(isTopLevelPromptEntry);
-          const turnEnd = nextPromptOffset < 0 ? entries.length : promptIndex + 1 + nextPromptOffset;
+          const turnEnd = replyBoundaryIndex >= 0
+            ? replyBoundaryIndex + 1
+            : nextPromptOffset < 0 ? entries.length : promptIndex + 1 + nextPromptOffset;
           const replyEntries = entries.slice(promptIndex + 1, turnEnd)
             .filter((entry) => entry?.kind === "send-message");
           for (const entry of replyEntries) {
@@ -334,32 +357,47 @@ export class GrokClient {
               await options.onApproval?.(entry);
             }
           }
+          if (replyBoundaryIndex >= 0 && replyEntries.length) {
+            return this.replyResult(replyEntries);
+          }
           if (replyEntries.length) {
-            const busy = await this.isAgentBusy(agentId, options);
+            const agent = await this.getAgentStatus(agentId, options);
+            const busy = agent?.isRunning === true || agent?.isComposingMessage === true;
             if (busy) {
               busyReplyObserved = true;
               stableReplySignature = undefined;
               stableReplySince = undefined;
+              // Freeze the live completion witness only while the agent is busy.
+              // Never treat the later current lastMessageId as reply ownership.
+              if (typeof agent?.lastMessageId === "string"
+                && replyEntries.some((entry) => entry?.id === agent.lastMessageId)) {
+                completionCandidateId = agent.lastMessageId;
+              }
             } else if (busyReplyObserved) {
-              return { messageId: replyEntries.at(-1).id, ...this.getReplyContent(replyEntries) };
+              return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
             } else {
               const signature = replyEntries.map((entry, index) => entry?.id ?? `entry-${index}`).join(":");
               if (signature !== stableReplySignature) {
                 stableReplySignature = signature;
                 stableReplySince = Date.now();
               } else if (Date.now() - stableReplySince >= Math.max(5_000, this.pollIntervalMs * 2)) {
-                return { messageId: replyEntries.at(-1).id, ...this.getReplyContent(replyEntries) };
+                return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
               }
             }
           }
         } else if (promptObserved) {
           const replyEntries = entries.filter((entry) => entry?.kind === "send-message");
           if (replyEntries.length) {
-            const busy = await this.isAgentBusy(agentId, options);
+            const agent = await this.getAgentStatus(agentId, options);
+            const busy = agent?.isRunning === true || agent?.isComposingMessage === true;
             if (busy) {
               busyReplyObserved = true;
+              if (typeof agent?.lastMessageId === "string"
+                && replyEntries.some((entry) => entry?.id === agent.lastMessageId)) {
+                completionCandidateId = agent.lastMessageId;
+              }
             } else if (busyReplyObserved) {
-              return { messageId: replyEntries.at(-1).id, ...this.getReplyContent(replyEntries) };
+              return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
             }
           }
         }
